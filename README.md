@@ -1,2 +1,3 @@
 # auto-hack
-使用”高端“的方法Hack他人代码
+
+全自动化 Codeforces 的 Div.3 公开 Hack。
