@@ -1,0 +1,17 @@
+# 本地测试数据与 hack 结果不上传
+test/
+hack/
+
+# 编译产物
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+
+# 编辑器
+.idea/
+.vscode/
