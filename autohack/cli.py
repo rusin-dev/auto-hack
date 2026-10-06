@@ -323,7 +323,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  python main.py                      交互式选择题目并配置\n"
+            "  python main.py                      交互式选择题目（未配置时自动\n"
+            "                                       新开窗口进入配置向导）\n"
             "  python main.py -p T1                用已有 config.yaml 对拍（新窗口）\n"
             "  python main.py -p T1 -r 0           无休止对拍\n"
             "  python main.py -p T1 -r 5000 -s 1   指定轮数与随机种子\n"
@@ -352,6 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bar", action="store_true", help="强制显示进度条")
     parser.add_argument("--no-bar", action="store_true", help="强制关闭进度条")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--wizard", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("-y", "--yes", action="store_true", help="跳过确认直接开拍")
     parser.add_argument("-q", "--quiet", action="store_true", help="只输出结果")
     return parser
@@ -525,6 +527,34 @@ def _widen_console(cols: int = 168, rows: int = 60) -> None:
         pass
 
 
+def _enable_vt() -> None:
+    """打开本进程的控制台 VT 处理。
+
+    经典 conhost 默认不开 VT，rich 会因此判定为 legacy 控制台并降级渲染
+    （进度条字符从 ━ 变成 -、渲染走 Windows API 路径）。在创建 rich Console
+    之前开一下 VT 即可走完整 ANSI 渲染。VT 不可用（老系统 / 输出被重定向）
+    时静默跳过，rich 自己会照常降级。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ENABLE_PROCESSED_OUTPUT = 0x0001
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = k32.GetStdHandle(-11)               # STD_OUTPUT_HANDLE
+        if not handle:
+            return
+        mode = ctypes.c_uint(0)
+        if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            k32.SetConsoleMode(handle,
+                               mode.value | ENABLE_PROCESSED_OUTPUT
+                               | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:                                # noqa: BLE001, S110
+        pass
+
+
 def _wait_key(message: str = "按任意键退出... ") -> None:
     print(message, end="", flush=True)
     try:
@@ -538,9 +568,16 @@ def _wait_key(message: str = "按任意键退出... ") -> None:
     print()
 
 
-def _spawn_window(args, problem_dir: Path, cfg: Config) -> int:
-    cmd = [sys.executable, "-u", str(SCRIPT), "--worker",
-           "-p", problem_dir.name, "-y"]
+def _spawn_window(args, problem_dir: Path, cfg: Config | None,
+                  wizard: bool = False) -> int:
+    """新开独立窗口：worker 模式跑对拍，wizard 模式先进配置向导。"""
+    cmd = [sys.executable, "-u", str(SCRIPT),
+           "--wizard" if wizard else "--worker",
+           "-p", problem_dir.name]
+    # worker 模式下父窗口已经确认过，直接开拍；
+    # 配置向导模式把「配完是否开拍」的确认交给新窗口自己问
+    if args.yes or not wizard:
+        cmd.append("-y")
     if args.rounds is not None:
         cmd += ["-r", str(args.rounds)]
     if args.seed is not None:
@@ -561,7 +598,7 @@ def _spawn_window(args, problem_dir: Path, cfg: Config) -> int:
     if args.quiet:
         cmd.append("-q")
 
-    title = f"auto-hack | {problem_dir.name}"
+    title = f"auto-hack | {problem_dir.name}" + (" 配置" if wizard else "")
     popen_kwargs: dict = {"cwd": str(REPO_ROOT)}
     if os.name == "nt":
         popen_kwargs["creationflags"] = WINDOWS_NEW_CONSOLE
@@ -572,7 +609,17 @@ def _spawn_window(args, problem_dir: Path, cfg: Config) -> int:
         subprocess.Popen(cmd, **popen_kwargs)
     except OSError as exc:
         _p(f"新开窗口失败: {exc}，改为在当前窗口运行。")
+        if wizard:
+            return _configure_and_run(args, problem_dir, wait=False)
         return _run_here(args, problem_dir, cfg, wait=False)
+
+    if wizard:
+        _p("已打开新窗口进入配置向导：")
+        _p(f"  窗口标题 : {title}")
+        _p(f"  题目     : {problem_dir.name}")
+        _p("  完成配置后会在该窗口确认并自动开始对拍。")
+        _p("  本窗口可继续使用。")
+        return 0
 
     rounds = args.rounds if args.rounds is not None else cfg.rounds
     max_hits = args.max_hits if args.max_hits is not None else cfg.max_hits
@@ -601,6 +648,7 @@ def _run_here(args, problem_dir: Path, cfg: Config, wait: bool) -> int:
     rounds = args.rounds if args.rounds is not None else cfg.rounds
     max_hits = args.max_hits if args.max_hits is not None else cfg.max_hits
 
+    _enable_vt()          # 必须在 rich Console 创建之前打开
     reporter = ProgressReporter(total=rounds, enabled=_bar_enabled(args))
 
     reporter.print(f"  题目 {problem_dir.name}  |  "
@@ -650,6 +698,48 @@ def _worker(args) -> int:
     return _run_here(args, problem_dir, cfg, wait=True)
 
 
+def _configure_and_run(args, problem_dir: Path, wait: bool) -> int:
+    """配置向导 → 确认开拍 → 对拍。
+
+    ``wait=True`` 时全程结束前等待按键（供独立窗口使用，窗口不会一闪而过）。
+    """
+    cfg = _wizard(problem_dir)
+    if cfg is None:
+        if wait:
+            _wait_key()
+        return 1
+
+    rounds = args.rounds if args.rounds is not None else cfg.rounds
+    max_hits = args.max_hits if args.max_hits is not None else cfg.max_hits
+    if not args.yes and not args.quiet:
+        _p(f"\n即将对拍 {problem_dir.name}: 轮数 {_rounds_text(rounds)}, "
+           f"TLE={args.tl_ms or cfg.tl_ms}ms, "
+           f"MLE={args.ml_mb or cfg.ml_mb}MB, "
+           f"停止条件={_hits_text(max_hits)}")
+        if not _ask("开始？(y/n)", "y").lower().startswith("y"):
+            _p("已取消")
+            if wait:
+                _wait_key()
+            return 0
+    return _run_here(args, problem_dir, cfg, wait=wait)
+
+
+def _wizard_worker(args) -> int:
+    """独立窗口模式：直接进入配置向导，配完确认后在本窗口开拍。"""
+    if not args.problem:
+        _p("--wizard 必须配合 -p 使用")
+        return 1
+    problem_dir = TEST_ROOT / args.problem
+    if not problem_dir.is_dir():
+        _p(f"找不到题目目录: {problem_dir}")
+        _wait_key()
+        return 1
+    _set_console_title(f"auto-hack | {problem_dir.name} 配置")
+    _widen_console()
+    _p(BANNER)
+    return _configure_and_run(args, problem_dir, wait=True)
+
+
 # --------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------
@@ -659,6 +749,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.worker:
         return _worker(args)
+    if args.wizard:
+        return _wizard_worker(args)
 
     _p(BANNER)
 
@@ -675,16 +767,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     cfg = _load_cfg(problem_dir)
-    if cfg is None or args.reconfig:
-        cfg = _wizard(problem_dir)
-        if cfg is None:
-            return 1
-    elif not args.yes and not args.quiet:
+    need_wizard = cfg is None or args.reconfig
+    if not need_wizard and not args.yes and not args.quiet:
         _p(f"题目 {problem_dir.name} 已有配置 ({problem_dir / 'config.yaml'})")
         if not _ask("直接开始对拍？(y/n)", "y").lower().startswith("y"):
-            cfg = _wizard(problem_dir)
-            if cfg is None:
-                return 1
+            need_wizard = True
+
+    if need_wizard:
+        # 没配置 / 要重新配置：新开一个窗口直接进入配置向导，
+        # 配完在那个窗口确认并开拍（--no-window 时留在当前窗口）
+        if args.no_window:
+            return _configure_and_run(args, problem_dir, wait=False)
+        return _spawn_window(args, problem_dir, cfg, wizard=True)
 
     rounds = args.rounds if args.rounds is not None else cfg.rounds
     max_hits = args.max_hits if args.max_hits is not None else cfg.max_hits

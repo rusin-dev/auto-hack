@@ -108,9 +108,9 @@ def _level_count(level: dict, env: dict) -> int:
     if step > 0:
         end = hi if level.get("inclusive", True) else hi - 1
         return max(0, (end - lo) // step + 1)
-    start = lo
-    end = hi if level.get("inclusive", True) else hi + 1
-    return max(0, (start - end) // (-step) + 1)
+    # 倒序：从 hi 走到 lo，lo/hi 恒为下界/上界（lo <= hi）
+    end = lo if level.get("inclusive", True) else lo + 1
+    return max(0, (hi - end) // (-step) + 1)
 
 
 def _array_lines(spec: VarSpec, cfg_vars: dict, rng: random.Random, env: dict,
@@ -122,7 +122,7 @@ def _array_lines(spec: VarSpec, cfg_vars: dict, rng: random.Random, env: dict,
     if override:
         counts = [max(0, evaluate(override, env))]
     elif spec.levels:
-        counts = [_level_count(level, env) for level in spec.levels[:2]]
+        counts = [_level_count(level, env) for level in spec.levels]
     else:
         count_expr = spec.count_expr
         if not count_expr:
@@ -138,11 +138,15 @@ def _array_lines(spec: VarSpec, cfg_vars: dict, rng: random.Random, env: dict,
         total *= c
     _spend(budget, total,
            f"数组 {spec.name} 要生成 {total} 个元素")
-    if len(counts) == 1:
-        return [" ".join(str(rng.randint(lo, hi)) for _ in range(counts[0]))]
+    if total == 0:
+        return []
 
-    rows, cols = counts[0], counts[1]
-    return [" ".join(str(rng.randint(lo, hi)) for _ in range(cols)) for _ in range(rows)]
+    # 逐维展开：每行放最后一维的元素（读入按 token 进行，行断在哪里都合法），
+    # 一维就是一整行，二维就是矩阵，三维及以上按最后一维折行。
+    cols = counts[-1]
+    rows = total // cols
+    return [" ".join(str(rng.randint(lo, hi)) for _ in range(cols))
+            for _ in range(rows)]
 
 
 def _spend(budget: dict, amount: int, what: str) -> None:
@@ -197,12 +201,6 @@ def _emit_rows(rows, cfg_vars: dict, cfg_opts: dict, rng: random.Random,
                         f"请检查多组测试次数与 n 的范围"
                     )
                 _emit_rows(row[2], cfg_vars, cfg_opts, rng, env, out, budget)
-
-
-def generate(plan: list, cfg) -> bytes:
-    """生成一条完整输入（UTF-8 字节）。"""
-    rng = random.Random(cfg.seed) if cfg.seed is not None else random.Random()
-    return generate_with(plan, cfg, rng)
 
 
 def generate_with(plan: list, cfg, rng: random.Random) -> bytes:

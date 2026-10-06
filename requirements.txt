@@ -1,3 +1,4 @@
 tree-sitter>=0.23
 tree-sitter-cpp>=0.23
 PyYAML>=6.0
+rich>=13.0

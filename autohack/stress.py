@@ -193,6 +193,10 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
 
     tl_seconds = max(cfg.tl_ms / 1000.0, 0.05)
     std_timeout = max(tl_seconds * 10.0, 10.0)
+    # 关掉 TLE 检查时放宽超时：否则慢程序会在 tl 附近被杀掉，
+    # 而 RE/WA 判定又都要求“没有超时”，导致这轮永远判不出任何命中。
+    hack_timeout = (tl_seconds + 0.2 if effective_checks.get("tle")
+                    else max(tl_seconds * 10.0, 10.0))
 
     stats = {"wa": 0, "tle": 0, "mle": 0, "re": 0, "std_fail": 0}
     agg = {"std_ms_sum": 0.0, "std_ms_max": 0.0,
@@ -230,7 +234,7 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
                 break
 
             hack_res = run_program(binaries["hack"], data,
-                                   timeout=tl_seconds + 0.2,
+                                   timeout=hack_timeout,
                                    ml_mb=cfg.ml_mb if effective_checks.get("mle") else None)
 
             reasons: list[str] = []
@@ -310,6 +314,12 @@ def save_hits(repo_root: Path, problem_dir: Path, cfg: Config, hits: list[Hit]) 
     out_dir = repo_root / HACK_DIR_NAME / problem_dir.name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # 先清掉上一次运行留下的命中文件，避免新旧结果混在一起
+    for pattern in ("*.in", "*.out"):
+        for old in out_dir.glob(pattern):
+            old.unlink(missing_ok=True)
+    (out_dir / "hits.txt").unlink(missing_ok=True)
+
     for name in ("std.cpp", "hack.cpp"):
         src = problem_dir / name
         if src.is_file():
@@ -332,19 +342,6 @@ def save_hits(repo_root: Path, problem_dir: Path, cfg: Config, hits: list[Hit]) 
         log_lines.append(f"{hit.index:03d}  {' '.join(hit.reasons)}")
     (out_dir / "hits.txt").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
     return out_dir
-
-
-def list_problems(test_root: Path) -> list[Path]:
-    test_root = Path(test_root)
-    if not test_root.is_dir():
-        return []
-    result = []
-    for child in sorted(test_root.iterdir()):
-        if not child.is_dir():
-            continue
-        if (child / "std.cpp").is_file() and (child / "hack.cpp").is_file():
-            result.append(child)
-    return result
 
 
 def scan_problems(test_root: Path) -> list[Path]:

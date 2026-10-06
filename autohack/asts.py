@@ -23,6 +23,7 @@ _FMT_RE = re.compile(
 _WORD_RE = re.compile(r"[A-Za-z_]\w*")
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 _CMP_OPS = ("<", "<=", ">", ">=")
+_MIRROR_OPS = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
 
 _VECTOR_BASES = {"vector", "array", "deque", "list", "set", "map"}
 _STRING_BASES = {"string", "wstring", "char_sequence"}
@@ -71,6 +72,7 @@ class Loop:
     end: int
     kind: str                   # for / while
     var: str | None = None
+    lo: int | None = None               # 起始值的字面量形式（非字面量时为 None）
     lo_expr: str | None = None
     hi_expr: str | None = None
     inclusive: bool = True
@@ -441,42 +443,55 @@ def _parse_for(node: Node, src: bytes) -> Loop:
             lt = _text(left, src)
             rt = _text(right, src)
             bound = None
+            var_on_left = True
             if loop.var and lt == loop.var:
                 bound = rt
             elif loop.var and rt == loop.var:
-                bound = lt
+                bound, var_on_left = lt, False
             elif _IDENT_RE.fullmatch(lt):
                 loop.var, bound = lt, rt
             elif _IDENT_RE.fullmatch(rt):
-                loop.var, bound = rt, lt
+                loop.var, bound, var_on_left = rt, lt, False
             if bound is not None:
-                if op in ("<", "<="):
+                # 循环变量可能写在比较式的右边（0 <= i），方向要先归一
+                eff_op = op if var_on_left else _MIRROR_OPS[op]
+                if eff_op in ("<", "<="):
                     loop.hi_expr = bound
-                    loop.inclusive = op == "<="
-                else:                                # i >= k
-                    if loop.lo is not None:
-                        loop.hi_expr = str(loop.lo)
-                        loop.lo_expr = bound
-                        loop.lo = None
-                        loop.inclusive = op == ">="
-                    else:
-                        loop.lo_expr = bound
-                        loop.inclusive = op == ">="
+                    loop.inclusive = eff_op == "<="
+                else:                                # i >= k，倒序循环
+                    # 起始值（init 或赋值表达式的右侧）成为上界，条件侧成为下界。
+                    # 起始值可能是表达式（n-1 这类非字面量），此时用 lo_expr 兜底，
+                    # 否则上界会丢失、数组长度推断不出来。
+                    start_expr = (str(loop.lo) if loop.lo is not None
+                                  else loop.lo_expr)
+                    loop.lo = None
+                    loop.lo_expr = bound
+                    loop.inclusive = eff_op == ">="
+                    if start_expr is not None:
+                        loop.hi_expr = start_expr
 
     upd = node.child_by_field_name("update")
     if upd is not None and upd.type == "update_expression":
         arg = upd.child_by_field_name("argument")
         if arg is not None and loop.var is None:
             loop.var = _text(arg, src)
-        op = upd.children[0].type if upd.children else ""
-        if op == "--":
+        # ++/-- 可能在前缀位置也可能在后缀位置，不能只看 children[0]
+        ops = [c.type for c in upd.children]
+        if "--" in ops:
             loop.step = -1
-        elif op == "+=":
-            argn = upd.children[-1] if upd.children else None
-            loop.step = _int_or_none(_text(argn, src)) or 1
-        elif op == "-=":
-            argn = upd.children[-1] if upd.children else None
-            loop.step = -(_int_or_none(_text(argn, src)) or 1)
+        elif "++" in ops:
+            loop.step = 1
+    elif upd is not None and upd.type == "assignment_expression":
+        # for 的更新位也可能是 i += 2 / i -= 2（assignment_expression）
+        left = upd.child_by_field_name("left")
+        right = upd.child_by_field_name("right")
+        op = upd.children[1].type if len(upd.children) > 1 else ""
+        if left is not None and op in ("+=", "-=") and loop.var is None:
+            loop.var = _text(left, src)
+        if right is not None and op in ("+=", "-="):
+            num = _int_or_none(_text(right, src))
+            if num:
+                loop.step = num if op == "+=" else -num
 
     return loop
 
