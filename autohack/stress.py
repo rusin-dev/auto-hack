@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import random
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import style
 from .asts import Scan, resolve_vars
 from .asts import scan as scan_source
 from .config import Config, config_path
@@ -20,18 +22,28 @@ HACK_DIR_NAME = "hack"
 UNLIMITED = 0          # rounds / max_hits 为 0 表示无休止
 
 
+def _resolve_threads(value) -> int:
+    """把用户给的线程数收敛成 >= 1 的整数（脏配置 / 0 / 负数都兜住）。"""
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
 @dataclass
 class Hit:
     index: int
     data: bytes
     reference: bytes
     reasons: list[str]
+    round_index: int = 0       # 命中发生在第几轮（多线程下完成顺序不定，落盘前按它排序）
 
 
 @dataclass
 class StressReport:
     problem: str
     rounds: int = 0
+    threads: int = 1
     hits: list[Hit] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
     aborted: str = ""
@@ -126,10 +138,12 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
            repo_root: Path, rounds: int | None = None,
            seed: int | None = None, checks: dict | None = None,
            max_hits: int | None = None, verbose: bool = True,
-           on_round=None, log=None) -> StressReport:
+           on_round=None, log=None, threads: int | None = None) -> StressReport:
     """执行对拍。
 
     ``rounds`` / ``max_hits`` 传 0 表示无休止。
+    ``threads`` > 1 时并行跑多路（默认取 ``cfg.threads``）：轮号按
+    1..N 依次领取，所以同一个种子下单轮数据与单线程完全一致。
     ``on_round`` 每跑完一轮回调一次 :class:`RoundInfo`，用于渲染进度条。
     ``log`` 覆盖日志输出（进度条需要先擦行再打印）。
     """
@@ -164,7 +178,7 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
     except BuildError as exc:
         report.aborted = str(exc)
         return report
-    say(f"  编译完成: {binaries['std'].name}, {binaries['hack'].name}")
+    say(style.ok(f"  编译完成: {binaries['std'].name}, {binaries['hack'].name}"))
 
     gen_call = None
     try:
@@ -189,7 +203,7 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
         except Exception as exc:                       # noqa: BLE001
             report.aborted = f"分析输入结构失败: {exc}"
             return report
-        say("  输入结构:\n" + plan_text(plan, 2))
+        say("  " + style.dim("输入结构:") + "\n" + plan_text(plan, 2))
 
     tl_seconds = max(cfg.tl_ms / 1000.0, 0.05)
     std_timeout = max(tl_seconds * 10.0, 10.0)
@@ -204,54 +218,92 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
     report.agg = agg
 
     rounds_desc = "无休止" if report.unlimited else f"{total_rounds} 轮"
-    say(f"  开始对拍: {rounds_desc}, TLE={cfg.tl_ms}ms, MLE={cfg.ml_mb}MB, "
-        f"停止条件={'无限制' if limit_hits <= 0 else str(limit_hits) + ' 个 hack 点'}")
+    workers = _resolve_threads(cfg.threads if threads is None else threads)
+    report.threads = workers
+    say(style.title(f"  开始对拍: {rounds_desc}, TLE={cfg.tl_ms}ms, MLE={cfg.ml_mb}MB, "
+        f"停止条件={'无限制' if limit_hits <= 0 else str(limit_hits) + ' 个 hack 点'}"
+        + (f", 线程={workers}" if workers > 1 else "")))
 
-    index = 0
-    try:
-        while True:
-            index += 1
-            report.rounds = index
+    # ---- 并发控制 ----
+    #  claim_lock : 轮号分配（report.rounds 保持“跑到第 N 轮”的口径，与单线程一致）
+    #  state_lock : stats / agg / hits 等共享状态；进度条回调与日志也在它保护下，
+    #              保证 on_round 按完成序号顺序送达（否则进度条会倒退）
+    #  stop       : 置位后不再领取新一轮（攒够命中 / 中止 / Ctrl+C）
+    claim_lock = threading.Lock()
+    state_lock = threading.Lock()
+    stop = threading.Event()
+    claimed = 0                          # 已领取的轮次
+    completed = 0                        # 已判定完的轮次（进度条用它，天然单调）
 
-            try:
-                if gen_call is not None:
-                    data = gen_call(index)
-                else:
-                    rng = (random.Random(cfg.seed + index) if cfg.seed is not None
-                           else random.Random())
-                    data = generate_with(plan, cfg, rng)
-            except Exception as exc:                   # noqa: BLE001
-                report.aborted = f"生成数据失败(第 {index} 轮): {exc}"
-                break
+    def claim() -> int | None:
+        nonlocal claimed
+        with claim_lock:
+            if stop.is_set():
+                return None
+            if not report.unlimited and claimed >= total_rounds:
+                return None
+            claimed += 1
+            report.rounds = claimed
+            return claimed
 
-            std_res = run_program(binaries["std"], data, timeout=std_timeout)
-            if not std_res.ok:
+    def abort(message: str) -> None:
+        with state_lock:
+            if not report.aborted:
+                report.aborted = message      # 第一个失败原因最有参考价值
+        stop.set()
+
+    def run_round(index: int) -> None:
+        nonlocal completed
+        # ---- 生成数据（rng 按轮号播种，结果与线程调度无关）----
+        try:
+            if gen_call is not None:
+                data = gen_call(index)
+            else:
+                rng = (random.Random(cfg.seed + index) if cfg.seed is not None
+                       else random.Random())
+                data = generate_with(plan, cfg, rng)
+        except Exception as exc:                       # noqa: BLE001
+            abort(f"生成数据失败(第 {index} 轮): {exc}")
+            return
+
+        if stop.is_set():          # 其它线程已中止/到上限，省掉无谓的运行
+            return
+
+        std_res = run_program(binaries["std"], data, timeout=std_timeout)
+        if not std_res.ok:
+            with state_lock:
                 stats["std_fail"] += 1
-                report.aborted = (
-                    f"标程 std.cpp 在第 {index} 轮运行失败: {std_res.message}\n"
-                    f"  标程 stderr:\n{std_res.stderr.decode('utf-8', 'replace')[:500]}"
-                )
-                break
+            abort(
+                f"标程 std.cpp 在第 {index} 轮运行失败: {std_res.message}\n"
+                f"  标程 stderr:\n{std_res.stderr.decode('utf-8', 'replace')[:500]}"
+            )
+            return
 
-            hack_res = run_program(binaries["hack"], data,
-                                   timeout=hack_timeout,
-                                   ml_mb=cfg.ml_mb if effective_checks.get("mle") else None)
+        if stop.is_set():
+            return
 
-            reasons: list[str] = []
-            if effective_checks.get("tle") and hack_res.tle:
-                reasons.append(f"TLE ({cfg.tl_ms} ms)")
-                stats["tle"] += 1
-            if effective_checks.get("mle") and hack_res.mle:
-                reasons.append(f"MLE ({cfg.ml_mb} MB)")
-                stats["mle"] += 1
-            if effective_checks.get("re") and hack_res.crash and not hack_res.tle:
-                reasons.append(f"RE (exit {hack_res.rc})")
-                stats["re"] += 1
-            if effective_checks.get("wa") and not hack_res.tle and not hack_res.crash \
-                    and not hack_res.mle and not outputs_equal(std_res.stdout, hack_res.stdout):
-                reasons.append("WA")
-                stats["wa"] += 1
+        hack_res = run_program(binaries["hack"], data,
+                               timeout=hack_timeout,
+                               ml_mb=cfg.ml_mb if effective_checks.get("mle") else None)
 
+        # ---- 判定：结果先落在本地，共享状态统一加锁更新 ----
+        reasons: list[str] = []
+        bumps: dict[str, int] = {}
+        if effective_checks.get("tle") and hack_res.tle:
+            reasons.append(f"TLE ({cfg.tl_ms} ms)")
+            bumps["tle"] = bumps.get("tle", 0) + 1
+        if effective_checks.get("mle") and hack_res.mle:
+            reasons.append(f"MLE ({cfg.ml_mb} MB)")
+            bumps["mle"] = bumps.get("mle", 0) + 1
+        if effective_checks.get("re") and hack_res.crash and not hack_res.tle:
+            reasons.append(f"RE (exit {hack_res.rc})")
+            bumps["re"] = bumps.get("re", 0) + 1
+        if effective_checks.get("wa") and not hack_res.tle and not hack_res.crash \
+                and not hack_res.mle and not outputs_equal(std_res.stdout, hack_res.stdout):
+            reasons.append("WA")
+            bumps["wa"] = bumps.get("wa", 0) + 1
+
+        with state_lock:
             agg["std_ms_sum"] += std_res.ms
             agg["hack_ms_sum"] += hack_res.ms
             agg["std_ms_max"] = max(agg["std_ms_max"], std_res.ms)
@@ -259,47 +311,111 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
             if hack_res.peak_mb:
                 agg["peak_max"] = max(agg["peak_max"], hack_res.peak_mb)
 
-            if reasons:
-                report.hits.append(Hit(len(report.hits) + 1, data, std_res.stdout, reasons))
+            # 已经攒够命中数时，在途的这一轮不再落盘/计数，
+            # 这样 max_hits 的语义在多线程下与单线程完全一致。
+            recorded = bool(reasons) and (limit_hits <= 0
+                                          or len(report.hits) < limit_hits)
+            if recorded:
+                for key, value in bumps.items():
+                    stats[key] += value
+                report.hits.append(Hit(len(report.hits) + 1, data,
+                                       std_res.stdout, list(reasons),
+                                       round_index=index))
+                if limit_hits > 0 and len(report.hits) >= limit_hits:
+                    stop.set()
 
+            completed += 1
+            done = completed
+            hits_now = len(report.hits)
+            stats_now = dict(stats)
+
+            # 回调与日志在 state_lock 内：既避免行交错，也保证按完成序号顺序送达
             if on_round is not None:
                 on_round(RoundInfo(
-                    index=index,
-                    hits=len(report.hits),
+                    index=done,        # 用已完成轮数：并行时完成顺序乱，它才单调
+                    hits=hits_now,
                     std_ms=std_res.ms,
                     hack_ms=hack_res.ms,
                     peak_mb=hack_res.peak_mb,
                     reasons=list(reasons),
-                    stats=dict(stats),
+                    stats=stats_now,
                     unlimited=report.unlimited,
                 ))
 
-            if reasons:
-                say(f"  [第 {index} 轮] 命中 hack 点: {', '.join(reasons)}")
-                if limit_hits > 0 and len(report.hits) >= limit_hits:
-                    break
+            if recorded:
+                say(style.ok(f"  [第 {index} 轮] 命中 hack 点: {', '.join(reasons)}"))
 
-            if on_round is None and verbose and (index % 50 == 0
-                                                or (not report.unlimited and index == total_rounds)):
-                say(f"  ... 已跑 {index}"
+            if on_round is None and verbose and not stop.is_set() and (
+                    done % 50 == 0
+                    or (not report.unlimited and done == total_rounds)):
+                # 用已完成轮数而不是轮号：多线程下 8 号轮可能先跑完，
+                # 用轮号会提前打出“已跑 8/8 轮”
+                say(style.dim(f"  ... 已跑 {done}"
                     + (f"/{total_rounds}" if not report.unlimited else "")
-                    + f" 轮, 命中 {len(report.hits)}")
+                    + f" 轮, 命中 {hits_now}"))
 
-            if not report.unlimited and index >= total_rounds:
-                break
+    def loop() -> None:
+        while True:
+            index = claim()
+            if index is None:
+                return
+            run_round(index)
+
+    pool: list[threading.Thread] = []
+
+    def drain(tolerate: bool) -> None:
+        """等在跑的线程收尾；tolerate=True 时忽略等待期间重复的 Ctrl+C。"""
+        while True:
+            alive = [thread for thread in pool if thread.is_alive()]
+            if not alive:
+                return
+            try:
+                for thread in alive:
+                    thread.join(timeout=0.1)
+            except KeyboardInterrupt:
+                if not tolerate:
+                    raise
+                # 每个阶段都有超时兜底，继续等必然能收尾
+
+    try:
+        if workers <= 1:
+            loop()
+        else:
+            def worker() -> None:
+                try:
+                    loop()
+                except KeyboardInterrupt:         # 信号只投递给主线程，防御性兜底
+                    stop.set()
+                except Exception as exc:           # noqa: BLE001
+                    abort(f"对拍线程异常退出: {exc}")
+
+            pool = [threading.Thread(target=worker, daemon=True,
+                                     name=f"autohack-stress-{i + 1}")
+                    for i in range(workers)]
+            for thread in pool:
+                thread.start()
+            drain(tolerate=False)
     except KeyboardInterrupt:
         report.stopped = True
-        say("  已手动停止 (Ctrl+C)")
+        stop.set()
+        say(style.warn("  已手动停止 (Ctrl+C)"
+            + ("，等待进行中的轮次结束..." if any(t.is_alive() for t in pool) else "")))
+        drain(tolerate=True)
 
     report.stats = stats
     report.elapsed = time.perf_counter() - started
     report.speed = (report.rounds / report.elapsed) if report.elapsed > 0 else 0.0
 
     if report.hits:
+        # 多线程下命中按“完成顺序”追加，这里按轮号排回去并重新编号，
+        # 001.in / hits.txt 的顺序才与单线程（以及同种子的上次运行）一致。
+        report.hits.sort(key=lambda hit: hit.round_index)
+        for number, hit in enumerate(report.hits, 1):
+            hit.index = number
         report.output_dir = save_hits(repo_root, problem_dir, cfg, report.hits)
-        say(f"  结果已保存到 {report.output_dir}")
+        say(style.ok(f"  结果已保存到 {report.output_dir}"))
     elif not report.aborted:
-        say(f"  {rounds_desc}内没有找到 hack 点，可加大轮数或放宽/收紧取值范围")
+        say(style.warn(f"  {rounds_desc}内没有找到 hack 点，可加大轮数或放宽/收紧取值范围"))
 
     return report
 
@@ -358,45 +474,54 @@ def scan_problems(test_root: Path) -> list[Path]:
 
 def print_report(report: StressReport, log=None) -> None:
     emit = log if log is not None else (lambda text="": print(text, flush=True))
-    line = "-" * 58
+    line = style.dim("-" * 58)
 
     emit(line)
     if report.aborted:
-        emit(f"中止: {report.aborted}")
+        emit(style.bad(f"中止: {report.aborted}"))
 
     if report.unlimited:
-        mode = "无休止" + ("，手动停止" if report.stopped else "")
+        mode = ("无休止" + ("，手动停止" if report.stopped else ""))
+        mode = style.warn(mode) if report.stopped else mode
     else:
-        mode = "手动停止" if report.stopped else "正常结束"
+        mode = style.warn("手动停止") if report.stopped else style.ok("正常结束")
     emit(f"题目 {report.problem}  |  {mode}")
-    emit(f"  轮数: {report.rounds}    命中: {len(report.hits)} 个    "
+
+    hits_text = (style.ok(f"命中: {len(report.hits)} 个")
+                 if report.hits else f"命中: {len(report.hits)} 个")
+    emit(f"  轮数: {report.rounds}    {hits_text}    "
          f"总用时: {fmt_duration(report.elapsed)}    "
-         f"平均速度: {report.speed:.1f} 轮/秒")
+         f"平均速度: {report.speed:.1f} 轮/秒"
+         + (f"    线程: {report.threads}" if report.threads > 1 else ""))
 
     if report.stats:
-        bits = [f"{key.upper()}={report.stats.get(key, 0)}"
-                for key in ("wa", "tle", "mle", "re", "std_fail")
-                if report.stats.get(key)]
-        emit("  命中原因: " + ("  ".join(bits) if bits else "无"))
+        bits = []
+        for key in ("wa", "tle", "mle", "re", "std_fail"):
+            count = report.stats.get(key)
+            if count:
+                text = f"{key.upper()}={count}"
+                # 标程自己挂了是坏消息，其余命中都是好消息
+                bits.append(style.bad(text) if key == "std_fail" else style.ok(text))
+        emit("  命中原因: " + ("  ".join(bits) if bits else style.dim("无")))
 
     agg = report.agg or {}
     timed = max(1, report.rounds)
     emit(f"  标程 std   平均 {fmt_ms(agg.get('std_ms_sum', 0) / timed)}"
          f" / 最大 {fmt_ms(agg.get('std_ms_max'))}")
-    emit(f"  被测 hack  平均 {fmt_ms(agg.get('hack_ms_sum') / timed)}"
+    emit(f"  被测 hack  平均 {fmt_ms(agg.get('hack_ms_sum', 0) / timed)}"
          f" / 最大 {fmt_ms(agg.get('hack_ms_max'))}"
          f"    峰值内存 {fmt_mb(agg.get('peak_max'))} (限制 {report.ml_mb} MB)"
          f"    TLE 限制 {report.tl_ms} ms")
 
     if report.hits:
-        emit(f"  命中明细 ({len(report.hits)}):")
+        emit(style.ok(f"  命中明细 ({len(report.hits)}):"))
         for hit in report.hits[:20]:
-            emit(f"    {hit.index:03d}  {' '.join(hit.reasons)}")
+            emit(f"    {hit.index:03d}  {style.ok(' '.join(hit.reasons))}")
         if len(report.hits) > 20:
-            emit(f"    ... 另外 {len(report.hits) - 20} 个")
+            emit(style.dim(f"    ... 另外 {len(report.hits) - 20} 个"))
 
     for warning in report.warnings:
-        emit(f"  提示: {warning}")
+        emit(style.warn(f"  提示: {warning}"))
     if report.output_dir:
-        emit(f"  hack 数据: {report.output_dir}")
+        emit(f"  {style.dim('hack 数据:')} {report.output_dir}")
     emit(line)

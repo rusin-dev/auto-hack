@@ -142,5 +142,105 @@ class StressEndToEndTest(unittest.TestCase):
                              [h.data for h in second.hits])
 
 
+class ParallelStressTest(unittest.TestCase):
+    """多线程对拍：轮号领取、进度回调顺序、max_hits 语义与单线程一致。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory()
+        root = Path(cls._td.name)
+        problem = root / "test" / "T1"
+        problem.mkdir(parents=True)
+        (problem / "std.cpp").write_text(STD, encoding="utf-8")
+        (problem / "hack.cpp").write_text(HACK, encoding="utf-8")
+        cls.root = root
+        cls.problem = problem
+        cls.build = root / "build" / "T1"          # 两个用例共用编译缓存
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _cfg(self, **kw) -> Config:
+        base = dict(problem="T1",
+                    vars={"n": {"min": 1, "max": 8},
+                          "a": {"min": 1, "max": 100}})
+        base.update(kw)
+        return Config(**base)
+
+    def test_parallel_runs_every_round(self):
+        done: list[int] = []
+        cfg = self._cfg(rounds=6, max_hits=0, seed=42, threads=4)
+        report = stress(problem_dir=self.problem, cfg=cfg,
+                        build_root=self.build, repo_root=self.root / "r1",
+                        rounds=6, seed=42, verbose=False,
+                        on_round=done.append)
+
+        self.assertEqual(report.aborted, "")
+        self.assertEqual(report.threads, 4)
+        self.assertEqual(report.rounds, 6)
+        self.assertEqual(len(report.hits), 6)
+        self.assertEqual(report.stats["wa"], 6)
+        # 进度条回调按“已完成轮数”送达：4 线程下也必须单调不回退
+        indices = [info.index for info in done]
+        self.assertEqual(len(indices), 6)
+        self.assertEqual(indices, sorted(indices))
+        self.assertEqual(indices[-1], 6)
+        # 命中按轮号排序并重新编号：001..006 对应第 1..6 轮
+        self.assertEqual([h.round_index for h in report.hits], list(range(1, 7)))
+        self.assertEqual([h.index for h in report.hits], list(range(1, 7)))
+
+    def test_parallel_honors_max_hits(self):
+        """无休止 + 只留 1 个 hack 点：在途轮次也不能多存一个。"""
+        cfg = self._cfg(rounds=0, max_hits=1, seed=1, threads=4)
+        report = stress(problem_dir=self.problem, cfg=cfg,
+                        build_root=self.build, repo_root=self.root / "r2",
+                        rounds=0, seed=1, verbose=False)
+
+        self.assertEqual(report.aborted, "")
+        self.assertEqual(len(report.hits), 1)
+        self.assertEqual(report.stats["wa"], 1)
+        self.assertTrue(report.output_dir is not None)
+        self.assertTrue((report.output_dir / "001.in").is_file())
+        self.assertFalse((report.output_dir / "002.in").is_file())
+
+    def test_parallel_seed_matches_single_thread(self):
+        """同一个种子：多线程与单线程命中的数据完全一致（按轮号排序后）。"""
+        kw = dict(rounds=3, seed=11, verbose=False)
+        one = stress(problem_dir=self.problem, cfg=self._cfg(threads=1, max_hits=0),
+                     build_root=self.build, repo_root=self.root / "r3", **kw)
+        many = stress(problem_dir=self.problem, cfg=self._cfg(threads=4, max_hits=0),
+                      build_root=self.build, repo_root=self.root / "r4", **kw)
+        self.assertEqual([h.data for h in one.hits], [h.data for h in many.hits])
+        self.assertEqual([h.round_index for h in one.hits],
+                         [h.round_index for h in many.hits])
+
+    def test_parallel_ctrl_c_stops_workers(self):
+        """主线程等待线程时收到 Ctrl+C：置停止位并等在途轮次收尾。"""
+        import threading as _threading
+        from unittest import mock
+
+        real_join = _threading.Thread.join
+        pending = {"armed": True}
+
+        def fake_join(self, timeout=None):
+            # 只截获 drain() 对工作线程的 join；内存监视线程的 join 照常走
+            if pending["armed"] and self.name.startswith("autohack-stress-"):
+                pending["armed"] = False
+                raise KeyboardInterrupt
+            return real_join(self, timeout)
+
+        cfg = self._cfg(rounds=40, max_hits=0, seed=5, threads=3)
+        with mock.patch.object(_threading.Thread, "join", fake_join):
+            report = stress(problem_dir=self.problem, cfg=cfg,
+                            build_root=self.build, repo_root=self.root / "r5",
+                            rounds=40, seed=5, verbose=False)
+
+        self.assertTrue(report.stopped)
+        self.assertEqual(report.aborted, "")
+        # 停止位生效后不该再把 40 轮跑完（否则说明线程没收到停止信号）
+        self.assertLess(report.rounds, 40)
+
+
 if __name__ == "__main__":
     unittest.main()

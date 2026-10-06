@@ -21,6 +21,7 @@ class Config:
     ml_mb: int = 256
     rounds: int = 500
     max_hits: int = 1
+    threads: int = 1                   # 对拍并行线程数
     seed: int | None = None
     alphabet: str = "abcdefghijklmnopqrstuvwxyz"
     checks: dict = field(default_factory=lambda: dict(DEFAULT_CHECKS))

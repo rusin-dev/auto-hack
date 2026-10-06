@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import style
 from .asts import VarSpec, resolve_vars
 from .asts import scan as scan_source
 from .config import Config, load_config, save_config
@@ -19,12 +20,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_ROOT = REPO_ROOT / "test"
 BUILD_ROOT = REPO_ROOT / "build"
 SCRIPT = REPO_ROOT / "main.py"
-
-BANNER = """
-============================================================
-  auto-hack  自动 Hack 对拍工具
-============================================================
-"""
 
 WINDOWS_NEW_CONSOLE = 0x00000010        # CREATE_NEW_CONSOLE
 
@@ -37,12 +32,30 @@ def _p(msg: str = "") -> None:
         print(msg.encode("utf-8", "replace").decode(enc, "replace"), flush=True)
 
 
+def _banner() -> str:
+    """横幅：边线暗淡、标题粗体青色（非 TTY 自动退回纯文本）。"""
+    rule = "=" * 60
+    return ("\n" + style.dim(rule) + "\n"
+            + style.title("  auto-hack  自动 Hack 对拍工具") + "\n"
+            + style.dim(rule) + "\n")
+
+
 def _rounds_text(value: int) -> str:
     return "无休止" if value <= 0 else f"{value} 轮"
 
 
 def _hits_text(value: int) -> str:
     return "不限制" if value <= 0 else f"{value} 个 hack 点"
+
+
+def _threads_of(cfg: Config | None, args=None) -> int:
+    """CLI 的 -j 优先，其次配置里的 threads；脏值一律收敛成 >= 1。"""
+    override = getattr(args, "threads", None)
+    value = override if override is not None else (cfg.threads if cfg else 1)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
 
 
 # --------------------------------------------------------------------------
@@ -64,13 +77,13 @@ def _ask(prompt: str, default: str | None = None) -> str:
 def _ask_choice(prompt: str, choices: dict[str, str], default: str) -> str:
     _p(prompt)
     for key, label in choices.items():
-        mark = " (默认)" if key == default else ""
+        mark = style.dim(" (默认)") if key == default else ""
         _p(f"  {key}) {label}{mark}")
     while True:
         raw = _ask("请输入编号", default)
         if raw in choices:
             return raw
-        _p("  输入无效，请重新输入")
+        _p(style.warn("  输入无效，请重新输入"))
 
 
 def _ask_int(prompt: str, default: int, minimum: int | None = None,
@@ -80,13 +93,13 @@ def _ask_int(prompt: str, default: int, minimum: int | None = None,
         try:
             value = int(raw)
         except ValueError:
-            _p("  请输入整数")
+            _p(style.warn("  请输入整数"))
             continue
         if minimum is not None and value < minimum:
-            _p(f"  不能小于 {minimum}")
+            _p(style.warn(f"  不能小于 {minimum}"))
             continue
         if maximum is not None and value > maximum:
-            _p(f"  不能大于 {maximum}")
+            _p(style.warn(f"  不能大于 {maximum}"))
             continue
         return value
 
@@ -117,7 +130,7 @@ def _ask_range(prompt: str, default: tuple[int, int]) -> tuple[int, int]:
         raw = _ask(f"{prompt} ({hint})", f"{default[0]} {default[1]}")
         pair = _split_pair(raw)
         if pair is None:
-            _p("  格式不对，请输入两个整数，用空格/逗号/.. 分隔")
+            _p(style.warn("  格式不对，请输入两个整数，用空格/逗号/.. 分隔"))
             continue
         return pair
 
@@ -174,7 +187,7 @@ def _locate_generator(problem_dir: Path) -> Path | None:
 def _ask_generator(problem_dir: Path) -> str | None:
     found = _locate_generator(problem_dir)
     if found is not None:
-        _p(f"已找到生成器: {found.name}")
+        _p(style.ok(f"已找到生成器: {found.name}"))
         use = _ask("直接使用它？(y/n)", "y").lower()
         if use.startswith("y"):
             return found.name
@@ -183,17 +196,17 @@ def _ask_generator(problem_dir: Path) -> str | None:
     raw = _ask("生成器路径", "")
     if not raw:
         if found is None:
-            _p(f"没有生成器，无法继续。请把 gen.cpp 放到 {problem_dir} 后重试。")
+            _p(style.bad(f"没有生成器，无法继续。请把 gen.cpp 放到 {problem_dir} 后重试。"))
             return None
         return found.name
     src = Path(raw).expanduser()
     if not src.is_file():
-        _p(f"找不到文件: {src}")
+        _p(style.bad(f"找不到文件: {src}"))
         return None
     target = problem_dir / f"gen{src.suffix.lower()}"
     if src.resolve() != target.resolve():
         shutil.copy2(src, target)
-        _p(f"已复制为 {target.name}")
+        _p(style.ok(f"已复制为 {target.name}"))
     return target.name
 
 
@@ -204,12 +217,14 @@ def _ask_runtime(cfg: Config) -> None:
                           maximum=100_000_000)
     cfg.max_hits = _ask_int("找到几个 hack 点后停止 (0 = 不限制)",
                             cfg.max_hits, minimum=0, maximum=100_000)
+    cfg.threads = _ask_int("对拍线程数 (并行跑几路)", _threads_of(cfg),
+                           minimum=1, maximum=64)
     seed_raw = _ask("随机种子（留空 = 每次不同）", "")
     cfg.seed = int(seed_raw) if seed_raw.strip() else None
 
 
 def _wizard(problem_dir: Path) -> Config | None:
-    _p(f"\n>>> 正在配置题目: {problem_dir.name}")
+    _p("\n" + style.title(f">>> 正在配置题目: {problem_dir.name}"))
 
     kind_choice = _ask_choice(
         "\n请选择题目类型（决定数据怎么生成）:",
@@ -231,35 +246,35 @@ def _wizard(problem_dir: Path) -> Config | None:
 
     cfg = Config(problem=problem_dir.name, kind=kind, gen=gen_name)
     if kind == "custom":
-        _p("已选择自定义生成器，数据范围由生成器自己决定。")
+        _p(style.ok("已选择自定义生成器，数据范围由生成器自己决定。"))
         _ask_runtime(cfg)
         save_config(problem_dir, cfg)
-        _p(f"配置已保存: {problem_dir / 'config.yaml'}")
+        _p(style.ok(f"配置已保存: {problem_dir / 'config.yaml'}"))
         return cfg
 
     # ---- 标准模式：AST 识别 ----
     source_path = problem_dir / "std.cpp"
     if not source_path.is_file() or source_path.stat().st_size == 0:
-        _p(f"错误: {source_path} 不存在或是空文件，请先写好标程代码。")
+        _p(style.bad(f"错误: {source_path} 不存在或是空文件，请先写好标程代码。"))
         return None
 
     source = source_path.read_text(encoding="utf-8", errors="replace")
-    _p(f"正在用 AST 分析 {source_path.name} ...")
+    _p(style.dim(f"正在用 AST 分析 {source_path.name} ..."))
     try:
         scanned = scan_source(source)
         specs, warnings = resolve_vars(scanned)
     except Exception as exc:                          # noqa: BLE001
-        _p(f"分析失败: {exc}")
+        _p(style.bad(f"分析失败: {exc}"))
         return None
 
     for warning in warnings:
-        _p(f"  提示: {warning}")
+        _p(style.warn(f"  提示: {warning}"))
 
     if not specs:
-        _p("没有识别到任何输入变量，请确认 std.cpp 里有 cin/scanf/getline。")
+        _p(style.bad("没有识别到任何输入变量，请确认 std.cpp 里有 cin/scanf/getline。"))
         return None
 
-    _p("\n识别到的输入变量:")
+    _p("\n" + style.title("识别到的输入变量:"))
     _p(f"  {'#':<3}{'名称':<10}{'类型':<8}{'说明':<22}{'行号':<6}")
     for i, spec in enumerate(specs, 1):
         _p(f"  {i:<3}{spec.name:<10}{spec.kind:<8}{_level_desc(spec):<22}{spec.line:<6}")
@@ -292,7 +307,7 @@ def _wizard(problem_dir: Path) -> Config | None:
             if count_raw.strip():
                 entry["count"] = count_raw.strip()
             elif spec.needs_count:
-                _p("     必须填写元素个数，否则无法生成数据。")
+                _p(style.bad("     必须填写元素个数，否则无法生成数据。"))
                 return None
         cfg.vars[spec.name] = entry
 
@@ -307,8 +322,8 @@ def _wizard(problem_dir: Path) -> Config | None:
     }
 
     save_config(problem_dir, cfg)
-    _p(f"\n配置已保存: {problem_dir / 'config.yaml'}")
-    _p("下次可直接用 python main.py -p " + problem_dir.name + " 开拍。")
+    _p(style.ok(f"\n配置已保存: {problem_dir / 'config.yaml'}"))
+    _p(style.dim("下次可直接用 python main.py -p " + problem_dir.name + " 开拍。"))
     return cfg
 
 
@@ -328,6 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python main.py -p T1                用已有 config.yaml 对拍（新窗口）\n"
             "  python main.py -p T1 -r 0           无休止对拍\n"
             "  python main.py -p T1 -r 5000 -s 1   指定轮数与随机种子\n"
+            "  python main.py -p T1 -j 4           4 个线程并行对拍\n"
             "  python main.py -p T1 --no-window    不开新窗口，在当前窗口跑\n"
             "  python main.py --list               列出 test/ 下的题目\n"
             "\n"
@@ -340,6 +356,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-r", "--rounds", type=int,
                         help="对拍轮数，0 = 无休止（覆盖配置）")
     parser.add_argument("-s", "--seed", type=int, help="随机种子")
+    parser.add_argument("-j", "--threads", type=int,
+                        help="对拍线程数，并行跑几路（覆盖配置，默认 1）")
     parser.add_argument("--tl", type=int, dest="tl_ms", help="时间限制（毫秒）")
     parser.add_argument("--ml", type=int, dest="ml_mb", help="内存限制（MB）")
     parser.add_argument("--max-hits", type=int,
@@ -415,21 +433,21 @@ def _split_problems() -> tuple[list[Path], list[Path], dict[Path, str | None]]:
 def _print_index(ready: list[Path], blocked: list[Path],
                  states: dict[Path, str | None]) -> None:
     if ready:
-        _p("\n可用题目：")
+        _p("\n" + style.ok("可用题目："))
         for i, path in enumerate(ready, 1):
             _p(f"  {i}) {path.name}")
     if blocked:
         base = len(ready)
-        _p("\n不可用题目：")
+        _p("\n" + style.warn("不可用题目："))
         for i, path in enumerate(blocked, 1):
-            _p(f"   {base + i}) {path.name}（{states[path]}）")
+            _p(f"   {base + i}) {path.name}（{style.bad(states[path])}）")
 
 
 def _select_problem(args) -> Path | None:
     ready, blocked, states = _split_problems()
     all_dirs = ready + blocked
     if not all_dirs:
-        _p(f"没有在 {TEST_ROOT} 下找到题目。")
+        _p(style.bad(f"没有在 {TEST_ROOT} 下找到题目。"))
         _p("请新建一个目录，例如 test/T1/，并在里面放 std.cpp 和 hack.cpp。")
         return None
 
@@ -439,11 +457,11 @@ def _select_problem(args) -> Path | None:
                 continue
             state = states[path]
             if state and state.startswith("缺少"):
-                _p(f"题目 {path.name} 不可用: {state}")
+                _p(style.bad(f"题目 {path.name} 不可用: {state}"))
                 return None
             return path
-        _p(f"找不到题目 {args.problem!r}。现有题目: "
-           + ", ".join(p.name for p in all_dirs))
+        _p(style.bad(f"找不到题目 {args.problem!r}。现有题目: "
+                     + ", ".join(p.name for p in all_dirs)))
         return None
 
     if len(all_dirs) == 1 and not blocked:
@@ -463,7 +481,7 @@ def _select_problem(args) -> Path | None:
             return path
         state = states[path]
         if state and state.startswith("缺少"):
-            _p(f"  {path.name} 不可用: {state}，请先补齐源文件。")
+            _p(style.bad(f"  {path.name} 不可用: {state}，请先补齐源文件。"))
             continue
         return path                # 未配置 / 配置损坏 -> 下一步进配置向导
 
@@ -556,7 +574,7 @@ def _enable_vt() -> None:
 
 
 def _wait_key(message: str = "按任意键退出... ") -> None:
-    print(message, end="", flush=True)
+    print(style.dim(message), end="", flush=True)
     try:
         import msvcrt
         msvcrt.getch()
@@ -588,6 +606,8 @@ def _spawn_window(args, problem_dir: Path, cfg: Config | None,
         cmd += ["--ml", str(args.ml_mb)]
     if args.max_hits is not None:
         cmd += ["--max-hits", str(args.max_hits)]
+    if args.threads is not None:
+        cmd += ["-j", str(args.threads)]
     for name in ("no_tle", "no_mle", "no_wa", "no_re"):
         if getattr(args, name):
             cmd.append("--" + name.replace("_", "-"))
@@ -608,28 +628,31 @@ def _spawn_window(args, problem_dir: Path, cfg: Config | None,
     try:
         subprocess.Popen(cmd, **popen_kwargs)
     except OSError as exc:
-        _p(f"新开窗口失败: {exc}，改为在当前窗口运行。")
+        _p(style.bad(f"新开窗口失败: {exc}，改为在当前窗口运行。"))
         if wizard:
             return _configure_and_run(args, problem_dir, wait=False)
         return _run_here(args, problem_dir, cfg, wait=False)
 
     if wizard:
-        _p("已打开新窗口进入配置向导：")
-        _p(f"  窗口标题 : {title}")
-        _p(f"  题目     : {problem_dir.name}")
-        _p("  完成配置后会在该窗口确认并自动开始对拍。")
-        _p("  本窗口可继续使用。")
+        _p(style.title("已打开新窗口进入配置向导："))
+        _p(f"  {style.dim('窗口标题')} : {title}")
+        _p(f"  {style.dim('题目     ')} : {problem_dir.name}")
+        _p(style.dim("  完成配置后会在该窗口确认并自动开始对拍。"))
+        _p(style.dim("  本窗口可继续使用。"))
         return 0
 
     rounds = args.rounds if args.rounds is not None else cfg.rounds
     max_hits = args.max_hits if args.max_hits is not None else cfg.max_hits
-    _p("已启动独立窗口进行对拍：")
-    _p(f"  窗口标题 : {title}")
-    _p(f"  题目     : {problem_dir.name}")
-    _p(f"  轮数     : {_rounds_text(rounds)}   停止条件: {_hits_text(max_hits)}")
-    _p(f"  限制     : TLE={args.tl_ms or cfg.tl_ms}ms  "
+    threads = _threads_of(cfg, args)
+    _p(style.title("已启动独立窗口进行对拍："))
+    _p(f"  {style.dim('窗口标题')} : {title}")
+    _p(f"  {style.dim('题目     ')} : {problem_dir.name}")
+    _p(f"  {style.dim('轮数     ')} : {_rounds_text(rounds)}   "
+       f"{style.dim('停止条件:')} {_hits_text(max_hits)}   "
+       f"{style.dim('线程:')} {threads}")
+    _p(f"  {style.dim('限制     ')} : TLE={args.tl_ms or cfg.tl_ms}ms  "
        f"MLE={args.ml_mb or cfg.ml_mb}MB")
-    _p("  对拍结束后窗口会停在「按任意键退出」，本窗口可继续使用。")
+    _p(style.dim("  对拍结束后窗口会停在「按任意键退出」，本窗口可继续使用。"))
     return 0
 
 
@@ -647,13 +670,15 @@ def _run_here(args, problem_dir: Path, cfg: Config, wait: bool) -> int:
 
     rounds = args.rounds if args.rounds is not None else cfg.rounds
     max_hits = args.max_hits if args.max_hits is not None else cfg.max_hits
+    threads = _threads_of(cfg, args)
 
     _enable_vt()          # 必须在 rich Console 创建之前打开
     reporter = ProgressReporter(total=rounds, enabled=_bar_enabled(args))
 
-    reporter.print(f"  题目 {problem_dir.name}  |  "
+    reporter.print(style.title(f"  题目 {problem_dir.name}") + "  |  "
                    f"轮数 {_rounds_text(rounds)}  |  "
                    f"停止条件 {_hits_text(max_hits)}  |  "
+                   f"线程 {threads}  |  "
                    f"TLE={cfg.tl_ms}ms  MLE={cfg.ml_mb}MB")
     reporter.print("")
 
@@ -669,6 +694,7 @@ def _run_here(args, problem_dir: Path, cfg: Config, wait: bool) -> int:
         verbose=not args.quiet,
         on_round=reporter.update,
         log=reporter.print,
+        threads=threads,
     )
     reporter.finish()
     print_report(report, log=reporter.print)
@@ -683,18 +709,18 @@ def _run_here(args, problem_dir: Path, cfg: Config, wait: bool) -> int:
 
 def _worker(args) -> int:
     if not args.problem:
-        _p("--worker 必须配合 -p 使用")
+        _p(style.bad("--worker 必须配合 -p 使用"))
         return 1
     problem_dir = TEST_ROOT / args.problem
     cfg = _load_cfg(problem_dir)
     if cfg is None:
-        _p(f"找不到配置: {problem_dir / 'config.yaml'}")
+        _p(style.bad(f"找不到配置: {problem_dir / 'config.yaml'}"))
         _wait_key()
         return 1
 
     _set_console_title(f"auto-hack | {problem_dir.name}")
     _widen_console()
-    _p(BANNER)
+    _p(_banner())
     return _run_here(args, problem_dir, cfg, wait=True)
 
 
@@ -712,12 +738,14 @@ def _configure_and_run(args, problem_dir: Path, wait: bool) -> int:
     rounds = args.rounds if args.rounds is not None else cfg.rounds
     max_hits = args.max_hits if args.max_hits is not None else cfg.max_hits
     if not args.yes and not args.quiet:
-        _p(f"\n即将对拍 {problem_dir.name}: 轮数 {_rounds_text(rounds)}, "
+        _p(style.title(f"\n即将对拍 {problem_dir.name}"))
+        _p(f"  轮数 {_rounds_text(rounds)}, "
+           f"线程 {_threads_of(cfg, args)}, "
            f"TLE={args.tl_ms or cfg.tl_ms}ms, "
            f"MLE={args.ml_mb or cfg.ml_mb}MB, "
            f"停止条件={_hits_text(max_hits)}")
         if not _ask("开始？(y/n)", "y").lower().startswith("y"):
-            _p("已取消")
+            _p(style.warn("已取消"))
             if wait:
                 _wait_key()
             return 0
@@ -727,16 +755,16 @@ def _configure_and_run(args, problem_dir: Path, wait: bool) -> int:
 def _wizard_worker(args) -> int:
     """独立窗口模式：直接进入配置向导，配完确认后在本窗口开拍。"""
     if not args.problem:
-        _p("--wizard 必须配合 -p 使用")
+        _p(style.bad("--wizard 必须配合 -p 使用"))
         return 1
     problem_dir = TEST_ROOT / args.problem
     if not problem_dir.is_dir():
-        _p(f"找不到题目目录: {problem_dir}")
+        _p(style.bad(f"找不到题目目录: {problem_dir}"))
         _wait_key()
         return 1
     _set_console_title(f"auto-hack | {problem_dir.name} 配置")
     _widen_console()
-    _p(BANNER)
+    _p(_banner())
     return _configure_and_run(args, problem_dir, wait=True)
 
 
@@ -746,18 +774,19 @@ def _wizard_worker(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _enable_vt()          # 先开 VT，后续的彩色输出（含新窗口）才生效
 
     if args.worker:
         return _worker(args)
     if args.wizard:
         return _wizard_worker(args)
 
-    _p(BANNER)
+    _p(_banner())
 
     if args.list:
         ready, blocked, states = _split_problems()
         if not ready and not blocked:
-            _p(f"{TEST_ROOT} 下还没有题目")
+            _p(style.warn(f"{TEST_ROOT} 下还没有题目"))
             return 0
         _print_index(ready, blocked, states)
         return 0
@@ -769,7 +798,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = _load_cfg(problem_dir)
     need_wizard = cfg is None or args.reconfig
     if not need_wizard and not args.yes and not args.quiet:
-        _p(f"题目 {problem_dir.name} 已有配置 ({problem_dir / 'config.yaml'})")
+        _p(style.ok(f"题目 {problem_dir.name} 已有配置 ({problem_dir / 'config.yaml'})"))
         if not _ask("直接开始对拍？(y/n)", "y").lower().startswith("y"):
             need_wizard = True
 
@@ -784,11 +813,13 @@ def main(argv: list[str] | None = None) -> int:
     max_hits = args.max_hits if args.max_hits is not None else cfg.max_hits
 
     if not args.yes and not args.quiet:
-        _p(f"\n即将对拍 {problem_dir.name}: 轮数 {_rounds_text(rounds)}, "
+        _p(style.title(f"\n即将对拍 {problem_dir.name}"))
+        _p(f"  轮数 {_rounds_text(rounds)}, "
+           f"线程 {_threads_of(cfg, args)}, "
            f"TLE={args.tl_ms or cfg.tl_ms}ms, MLE={args.ml_mb or cfg.ml_mb}MB, "
            f"停止条件={_hits_text(max_hits)}")
         if not _ask("开始？(y/n)", "y").lower().startswith("y"):
-            _p("已取消")
+            _p(style.warn("已取消"))
             return 0
 
     if args.no_window:

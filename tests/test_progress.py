@@ -121,6 +121,139 @@ class EnabledReporterTest(unittest.TestCase):
         self.assertFalse(reporter._live)
 
 
+class ResizeGuardTest(unittest.TestCase):
+    """拖动窗口大小后不能留下一串残帧（conhost 重排导致光标几何失配）。"""
+
+    def _make(self, total: int = 10, settle: float = 0.0) -> tuple:
+        buf = io.StringIO()
+        console = Console(file=buf, force_terminal=True,
+                          width=120, height=40)
+        reporter = ProgressReporter(total=total, enabled=True, console=console)
+        reporter._settle = settle               # 0 = 旧行为：立即重锚
+        return reporter, buf, console
+
+    def test_resize_clears_and_replays_logs(self):
+        reporter, buf, console = self._make()
+        reporter.update(_info(1))
+        reporter.print("[第 1 轮] 心跳日志")
+        before = buf.getvalue()
+        self.assertNotIn("\x1b[2J", before)      # 未 resize 不该清屏
+
+        console._width = 60                       # 模拟拖动窗口
+        reporter.print("resize 后日志")
+        out = buf.getvalue()
+
+        self.assertIn("\x1b[2J", out[len(before):], "resize 后应清屏重锚")
+        self.assertGreaterEqual(out.count("[第 1 轮] 心跳日志"), 2,
+                                "旧日志应被重放")
+        self.assertEqual(out.count("resize 后日志"), 1,
+                         "新日志只应出现一次")
+        self.assertEqual(reporter._last_size.width,
+                         console._width - console.legacy_windows)
+        # live 帧在新几何下重新锚定
+        self.assertIsNotNone(reporter._progress.live._live_render._shape)
+        reporter.finish()
+
+    def test_refresh_wrapper_detects_resize(self):
+        """刷新线程路径（live.refresh）也必须先核对尺寸。"""
+        reporter, buf, console = self._make()
+        reporter.update(_info(1))
+        reporter.print("旧日志")
+        n = buf.getvalue().count("\x1b[2J")
+
+        console._width = 90
+        reporter._progress.live.refresh()
+        out = buf.getvalue()
+
+        self.assertEqual(out.count("\x1b[2J"), n + 1)
+        self.assertGreaterEqual(out.count("旧日志"), 2)
+        reporter.finish()
+
+    def test_stable_size_never_clears(self):
+        reporter, buf, console = self._make()
+        reporter.update(_info(1))
+        reporter.print("日志 A")
+        n = buf.getvalue().count("\x1b[2J")
+
+        for _ in range(5):
+            reporter.print("日志 B")
+            reporter._progress.live.refresh()
+        self.assertEqual(buf.getvalue().count("\x1b[2J"), n,
+                         "尺寸未变不应清屏")
+        reporter.finish()
+
+    def test_drag_defers_reanchor_until_settled(self):
+        """拖动中不重锚、不画帧；尺寸稳定后只重锚一次。"""
+        reporter, buf, console = self._make(settle=60.0)
+        reporter.update(_info(1))
+        reporter.print("旧日志")
+        n = buf.getvalue().count("\x1b[2J")
+
+        for w in (90, 75, 110):                  # 模拟连续拖动
+            console._width = w
+            self.assertFalse(reporter._check_resize(),
+                              "拖动中应返回 False 以抑制画帧")
+            reporter._progress.live.refresh()
+        out = buf.getvalue()
+        self.assertEqual(out.count("\x1b[2J"), n, "拖动中不应清屏重锚")
+
+        reporter._cand_since -= 61               # 模拟稳定窗口已过
+        self.assertTrue(reporter._check_resize())
+        out = buf.getvalue()
+        self.assertEqual(out.count("\x1b[2J"), n + 1, "停稳后应重锚一次")
+        self.assertGreaterEqual(out.count("旧日志"), 2)
+
+        # 再次刷新不重复清屏
+        reporter._progress.live.refresh()
+        self.assertEqual(buf.getvalue().count("\x1b[2J"), n + 1)
+        reporter.finish()
+
+    def test_log_during_drag_deferred_then_replayed_once(self):
+        """拖动期间的日志先挂起，重锚时随日志尾重放且只出现一次。"""
+        reporter, buf, console = self._make(settle=60.0)
+        reporter.update(_info(1))
+        reporter.print("拖前日志")
+
+        console._width = 80
+        self.assertFalse(reporter._check_resize())
+        reporter.print("拖动中的日志")
+        self.assertNotIn("拖动中的日志", buf.getvalue(),
+                         "拖动中日志不应立即落盘")
+
+        reporter._cand_since -= 61               # 稳定窗口已过
+        reporter._progress.live.refresh()        # 触发重锚 + 重放
+        out = buf.getvalue()
+        self.assertEqual(out.count("拖动中的日志"), 1,
+                         "挂起的日志重锚后应恰好出现一次")
+        self.assertGreaterEqual(out.count("拖前日志"), 2)
+        reporter.finish()
+
+    def test_finish_forces_reanchor(self):
+        """拖动中直接 finish 也要强制重锚定格，不能卡在抑制状态。"""
+        reporter, buf, console = self._make(settle=60.0)
+        reporter.update(_info(1))
+        reporter.print("收尾日志")
+        n = buf.getvalue().count("\x1b[2J")
+
+        console._width = 95
+        self.assertFalse(reporter._check_resize())   # 拖动中，仍被抑制
+        reporter.finish()                            # force=True 收尾
+
+        out = buf.getvalue()
+        self.assertEqual(out.count("\x1b[2J"), n + 1, "finish 应强制重锚")
+        self.assertFalse(reporter._live)
+        self.assertIsNotNone(reporter._progress.live._live_render._shape)
+
+    def test_disabled_reporter_ignores_resize(self):
+        reporter = ProgressReporter(total=10, enabled=False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            reporter.update(_info(1))
+            reporter.print("普通行")
+            reporter.finish()
+        self.assertNotIn("\x1b[", buf.getvalue())
+
+
 class SpeedAndStageTest(unittest.TestCase):
     def test_speed_zero_before_warmup(self):
         reporter = ProgressReporter(total=10, enabled=False)
