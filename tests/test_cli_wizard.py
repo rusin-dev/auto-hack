@@ -181,6 +181,18 @@ class VtHelperTest(unittest.TestCase):
         cli._enable_vt()          # 幂等
 
 
+class AskOptionalIntTest(unittest.TestCase):
+    """回归：向导里种子填了非数字会 int() 抛异常，整个配置流程崩掉。"""
+
+    def test_junk_input_is_asked_again(self):
+        with mock.patch("builtins.input", side_effect=["abc", ""]):
+            self.assertIsNone(cli._ask_optional_int("随机种子"))
+
+    def test_number_accepted_after_junk(self):
+        with mock.patch("builtins.input", side_effect=["abc", "-5"]):
+            self.assertEqual(cli._ask_optional_int("随机种子"), -5)
+
+
 class WizardWorkerTest(unittest.TestCase):
     def _run_worker(self, root: Path, argv):
         args = cli.build_parser().parse_args(argv)

@@ -3,10 +3,12 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from autohack.config import Config
 from autohack.generator import _edge_pool
-from autohack.stress import Hit, normalize, outputs_equal, save_hits, stress
+from autohack.runner import RunResult
+from autohack.stress import (Hit, normalize, outputs_equal, save_hits, stress)
 
 STD = """
 #include <iostream>
@@ -306,6 +308,94 @@ class ParallelStressTest(unittest.TestCase):
         self.assertEqual(report.aborted, "")
         # 停止位生效后不该再把 40 轮跑完（否则说明线程没收到停止信号）
         self.assertLess(report.rounds, 40)
+
+
+class StdFailureTest(unittest.TestCase):
+    """标程出问题时的行为：超时只跳过该轮，崩溃才中止并带出触发数据。"""
+
+    STD = """
+#include <iostream>
+using namespace std;
+int main() { int n; cin >> n; cout << n << "\\n"; return 0; }
+"""
+
+    def _problem(self, root: Path):
+        problem = root / "test" / "S"
+        problem.mkdir(parents=True, exist_ok=True)
+        (problem / "std.cpp").write_text(self.STD, encoding="utf-8")
+        (problem / "hack.cpp").write_text(self.STD, encoding="utf-8")
+        cfg = Config(problem="S", rounds=3, max_hits=0, seed=1,
+                     vars={"n": {"min": 1, "max": 5}})
+        return problem, cfg
+
+    @staticmethod
+    def _is_std(binary) -> bool:
+        return Path(binary).name.lower().startswith("std")
+
+    def test_std_tle_skips_round_instead_of_aborting(self):
+        """回归：标程一轮超时曾直接把整场对拍中止掉。"""
+        def fake(binary, data, timeout=5.0, ml_mb=None):
+            if self._is_std(binary):
+                return RunResult(tle=True, ms=11000.0, message="超时 > 11000 ms")
+            return RunResult(stdout=data, ms=1.0, peak_mb=2.0)
+
+        done: list[int] = []
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            problem, cfg = self._problem(root)
+            with mock.patch("autohack.stress.run_program", side_effect=fake):
+                report = stress(problem_dir=problem, cfg=cfg,
+                                build_root=root / "build", repo_root=root,
+                                rounds=3, seed=1, verbose=False,
+                                on_round=done.append)
+
+        self.assertEqual(report.aborted, "")
+        self.assertEqual(report.rounds, 3)
+        self.assertEqual(report.stats["std_tle"], 3)
+        self.assertEqual(report.stats["std_fail"], 0)
+        self.assertEqual(report.hits, [])
+        # 被跳过的轮次仍要推进进度，否则进度条会一直卡住
+        self.assertEqual([info.index for info in done], [1, 2, 3])
+        self.assertTrue(any("标程超过" in w for w in report.warnings),
+                        report.warnings)
+
+    def test_std_crash_aborts_with_offending_data(self):
+        def fake(binary, data, timeout=5.0, ml_mb=None):
+            if self._is_std(binary):
+                return RunResult(rc=139, crash=True, message="非零退出码 139",
+                                 stderr=b"segfault")
+            return RunResult(stdout=data, ms=1.0, peak_mb=2.0)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            problem, cfg = self._problem(root)
+            with mock.patch("autohack.stress.run_program", side_effect=fake):
+                report = stress(problem_dir=problem, cfg=cfg,
+                                build_root=root / "build", repo_root=root,
+                                rounds=3, seed=1, verbose=False)
+
+        self.assertIn("std.cpp 在第", report.aborted)
+        self.assertIn("触发数据", report.aborted)
+        self.assertEqual(report.stats["std_fail"], 1)
+        self.assertEqual(report.rounds, 1)          # 中止后不再领取新轮次
+
+    def test_missing_peak_memory_is_reported(self):
+        """拿不到峰值内存时 MLE 判不成，必须说出来而不是静默跳过。"""
+        def fake(binary, data, timeout=5.0, ml_mb=None):
+            return RunResult(stdout=b"1\n", ms=1.0, peak_mb=None)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            problem, cfg = self._problem(root)
+            with mock.patch("autohack.stress.run_program", side_effect=fake):
+                report = stress(problem_dir=problem, cfg=cfg,
+                                build_root=root / "build", repo_root=root,
+                                rounds=2, seed=1, verbose=False)
+
+        self.assertEqual(report.aborted, "")
+        self.assertEqual(report.stats["mle"], 0)
+        self.assertTrue(any("读不到" in w and "MLE" in w for w in report.warnings),
+                        report.warnings)
 
 
 if __name__ == "__main__":

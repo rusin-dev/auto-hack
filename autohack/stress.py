@@ -214,9 +214,10 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
     hack_timeout = (tl_seconds + 0.2 if effective_checks.get("tle")
                     else max(tl_seconds * 10.0, 10.0))
 
-    stats = {"wa": 0, "tle": 0, "mle": 0, "re": 0, "std_fail": 0}
+    stats = {"wa": 0, "tle": 0, "mle": 0, "re": 0, "std_fail": 0, "std_tle": 0}
     agg = {"std_ms_sum": 0.0, "std_ms_max": 0.0,
-           "hack_ms_sum": 0.0, "hack_ms_max": 0.0, "peak_max": 0.0}
+           "hack_ms_sum": 0.0, "hack_ms_max": 0.0, "peak_max": 0.0,
+           "peak_na": 0}
     report.agg = agg
 
     rounds_desc = "无休止" if report.unlimited else f"{total_rounds} 轮"
@@ -272,12 +273,29 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
             return
 
         std_res = run_program(binaries["std"], data, timeout=std_timeout)
+        if std_res.tle:
+            # 标程超时多半是数据规模填大了，不是标程有问题：跳过这一轮继续跑。
+            # 原来在这里直接 abort，第一轮慢数据就能把整场对拍中止掉。
+            with state_lock:
+                stats["std_tle"] += 1
+                agg["std_ms_sum"] += std_res.ms
+                agg["std_ms_max"] = max(agg["std_ms_max"], std_res.ms)
+                completed += 1
+                if on_round is not None:
+                    on_round(RoundInfo(
+                        index=completed, hits=len(report.hits),
+                        std_ms=std_res.ms, hack_ms=0.0, peak_mb=None,
+                        reasons=[], stats=dict(stats),
+                        unlimited=report.unlimited))
+            return
+
         if not std_res.ok:
             with state_lock:
                 stats["std_fail"] += 1
             abort(
                 f"标程 std.cpp 在第 {index} 轮运行失败: {std_res.message}\n"
-                f"  标程 stderr:\n{std_res.stderr.decode('utf-8', 'replace')[:500]}"
+                f"  标程 stderr:\n{std_res.stderr.decode('utf-8', 'replace')[:500]}\n"
+                f"  触发数据（前 300 字符）:\n{data[:300].decode('utf-8', 'replace')}"
             )
             return
 
@@ -312,6 +330,8 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
             agg["hack_ms_max"] = max(agg["hack_ms_max"], hack_res.ms)
             if hack_res.peak_mb:
                 agg["peak_max"] = max(agg["peak_max"], hack_res.peak_mb)
+            elif effective_checks.get("mle") and not (hack_res.tle or hack_res.crash):
+                agg["peak_na"] += 1       # 读不到峰值内存，这一轮等于没判 MLE
 
             # 已经攒够命中数时，在途的这一轮不再落盘/计数，
             # 这样 max_hits 的语义在多线程下与单线程完全一致。
@@ -407,6 +427,15 @@ def stress(problem_dir: Path, cfg: Config, build_root: Path,
     report.stats = stats
     report.elapsed = time.perf_counter() - started
     report.speed = (report.rounds / report.elapsed) if report.elapsed > 0 else 0.0
+
+    if stats["std_tle"]:
+        report.warnings.append(
+            f"有 {stats['std_tle']} 轮标程超过 {std_timeout:.1f}s 未参与判定；"
+            f"多半是数据规模过大，可把 n 的上限调小或把 TLE 设大")
+    if agg["peak_na"]:
+        report.warnings.append(
+            f"有 {agg['peak_na']} 轮读不到被测程序的峰值内存，这些轮相当于没判 MLE"
+            f"（Windows 上多为拿不到进程内存信息）")
 
     if report.hits:
         # 多线程下命中按“完成顺序”追加，这里按轮号排回去并重新编号，

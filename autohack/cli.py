@@ -136,6 +136,18 @@ def _ask_range(prompt: str, default: tuple[int, int]) -> tuple[int, int]:
         return pair
 
 
+def _ask_optional_int(prompt: str) -> int | None:
+    """允许留空的整数输入：填了却不是数字时重新问，而不是让向导整个崩掉。"""
+    while True:
+        raw = _ask(prompt, "")
+        if not raw.strip():
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            _p(style.warn("  请输入整数，或直接回车留空"))
+
+
 # --------------------------------------------------------------------------
 # 配置向导
 # --------------------------------------------------------------------------
@@ -229,8 +241,7 @@ def _ask_runtime(cfg: Config) -> None:
         },
         default=cfg.strategy if cfg.strategy in STRATEGIES else "mixed",
     )
-    seed_raw = _ask("随机种子（留空 = 每次不同）", "")
-    cfg.seed = int(seed_raw) if seed_raw.strip() else None
+    cfg.seed = _ask_optional_int("随机种子（留空 = 每次不同）")
 
 
 def _wizard(problem_dir: Path) -> Config | None:
