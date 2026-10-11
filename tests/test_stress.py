@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from autohack.config import Config
+from autohack.generator import _edge_pool
 from autohack.stress import Hit, normalize, outputs_equal, save_hits, stress
 
 STD = """
@@ -89,6 +90,58 @@ class SaveHitsTest(unittest.TestCase):
             text = (out_dir / "hits.txt").read_text(encoding="utf-8")
             self.assertIn("001  WA", text)
             self.assertNotIn("stale", text)
+
+
+class BoundaryStrategyStressTest(unittest.TestCase):
+    """只有 n=1 才错的程序：证明边界策略比纯随机实用得多。"""
+
+    N1_STD = """
+#include <iostream>
+using namespace std;
+int main() { int n, a; cin >> n >> a; cout << (n == 1 ? a * 2 : a) << "\\n"; }
+"""
+
+    N1_HACK = """
+#include <iostream>
+using namespace std;
+int main() { int n, a; cin >> n >> a; cout << (n <= 1 ? 0 : a) << "\\n"; }
+"""
+
+    VARS = {"n": {"min": 1, "max": 200000}, "a": {"min": 1, "max": 10 ** 9}}
+
+    def _run(self, root: Path, strategy: str, rounds: int, seed: int = 1):
+        problem = root / "test" / "N1"
+        problem.mkdir(parents=True, exist_ok=True)
+        (problem / "std.cpp").write_text(self.N1_STD, encoding="utf-8")
+        (problem / "hack.cpp").write_text(self.N1_HACK, encoding="utf-8")
+        cfg = Config(problem="N1", strategy=strategy, rounds=rounds,
+                     max_hits=1, seed=seed, tl_ms=1000, ml_mb=256,
+                     vars=dict(self.VARS))
+        return stress(problem_dir=problem, cfg=cfg,
+                      build_root=root / "build" / strategy, repo_root=root,
+                      rounds=rounds, seed=seed, verbose=False)
+
+    def test_edge_finds_boundary_only_bug(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = self._run(Path(td), "edge", 5)
+            self.assertEqual(report.aborted, "")
+            self.assertEqual(len(report.hits), 1)
+            # edge 策略只从边界池取值，n=1（下界）第 1 轮就出现
+            self.assertIn(int(report.hits[0].data.split()[0]),
+                          _edge_pool(1, 200000))
+            self.assertEqual(report.hits[0].data.split()[0], b"1")
+
+    def test_mixed_reaches_it_far_faster_than_random(self):
+        with tempfile.TemporaryDirectory() as td:
+            mixed = self._run(Path(td), "mixed", 30)
+            self.assertEqual(mixed.aborted, "")
+            self.assertEqual(len(mixed.hits), 1)
+            self.assertEqual(mixed.hits[0].data.split()[0], b"1")
+
+            # P(n=1) 在 [1, 200000] 上均匀随机是 5e-6：100 轮基本打不到
+            plain = self._run(Path(td), "random", 100)
+            self.assertEqual(plain.aborted, "")
+            self.assertEqual(len(plain.hits), 0)
 
 
 class StressEndToEndTest(unittest.TestCase):

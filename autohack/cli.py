@@ -13,6 +13,7 @@ from . import style
 from .asts import VarSpec, resolve_vars
 from .asts import scan as scan_source
 from .config import Config, load_config, save_config
+from .generator import STRATEGIES
 from .progress import ProgressReporter
 from .stress import print_report, scan_problems, stress
 
@@ -219,6 +220,15 @@ def _ask_runtime(cfg: Config) -> None:
                             cfg.max_hits, minimum=0, maximum=100_000)
     cfg.threads = _ask_int("对拍线程数 (并行跑几路)", _threads_of(cfg),
                            minimum=1, maximum=64)
+    cfg.strategy = _ask_choice(
+        "\n数据生成策略（hack 点绝大多数住在边界和退化结构上）:",
+        {
+            "mixed": "混合 —— 约 1/3 取边界值，偶尔整块全相等（推荐）",
+            "edge": "边界 —— 每个值都取端点/溢出值，数组常全相等",
+            "random": "纯随机 —— 区间内均匀随机（老行为）",
+        },
+        default=cfg.strategy if cfg.strategy in STRATEGIES else "mixed",
+    )
     seed_raw = _ask("随机种子（留空 = 每次不同）", "")
     cfg.seed = int(seed_raw) if seed_raw.strip() else None
 
@@ -358,6 +368,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-s", "--seed", type=int, help="随机种子")
     parser.add_argument("-j", "--threads", type=int,
                         help="对拍线程数，并行跑几路（覆盖配置，默认 1）")
+    parser.add_argument("--strategy", choices=list(STRATEGIES),
+                        help="数据生成策略（覆盖配置）：mixed 边界+随机 / "
+                             "edge 只取边界值 / random 纯随机")
     parser.add_argument("--tl", type=int, dest="tl_ms", help="时间限制（毫秒）")
     parser.add_argument("--ml", type=int, dest="ml_mb", help="内存限制（MB）")
     parser.add_argument("--max-hits", type=int,
@@ -608,6 +621,8 @@ def _spawn_window(args, problem_dir: Path, cfg: Config | None,
         cmd += ["--max-hits", str(args.max_hits)]
     if args.threads is not None:
         cmd += ["-j", str(args.threads)]
+    if args.strategy:
+        cmd += ["--strategy", args.strategy]
     for name in ("no_tle", "no_mle", "no_wa", "no_re"):
         if getattr(args, name):
             cmd.append("--" + name.replace("_", "-"))
@@ -649,7 +664,8 @@ def _spawn_window(args, problem_dir: Path, cfg: Config | None,
     _p(f"  {style.dim('题目     ')} : {problem_dir.name}")
     _p(f"  {style.dim('轮数     ')} : {_rounds_text(rounds)}   "
        f"{style.dim('停止条件:')} {_hits_text(max_hits)}   "
-       f"{style.dim('线程:')} {threads}")
+       f"{style.dim('线程:')} {threads}   "
+       f"{style.dim('策略:')} {args.strategy or cfg.strategy}")
     _p(f"  {style.dim('限制     ')} : TLE={args.tl_ms or cfg.tl_ms}ms  "
        f"MLE={args.ml_mb or cfg.ml_mb}MB")
     _p(style.dim("  对拍结束后窗口会停在「按任意键退出」，本窗口可继续使用。"))
@@ -667,6 +683,8 @@ def _run_here(args, problem_dir: Path, cfg: Config, wait: bool) -> int:
         cfg.ml_mb = args.ml_mb
     if args.seed is not None:
         cfg.seed = args.seed
+    if args.strategy:
+        cfg.strategy = args.strategy
 
     rounds = args.rounds if args.rounds is not None else cfg.rounds
     max_hits = args.max_hits if args.max_hits is not None else cfg.max_hits
@@ -679,6 +697,7 @@ def _run_here(args, problem_dir: Path, cfg: Config, wait: bool) -> int:
                    f"轮数 {_rounds_text(rounds)}  |  "
                    f"停止条件 {_hits_text(max_hits)}  |  "
                    f"线程 {threads}  |  "
+                   f"策略 {cfg.strategy}  |  "
                    f"TLE={cfg.tl_ms}ms  MLE={cfg.ml_mb}MB")
     reporter.print("")
 

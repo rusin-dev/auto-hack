@@ -13,6 +13,51 @@ DEFAULT_STR_MIN = 1
 DEFAULT_STR_MAX = 10
 MAX_ELEMENTS = 5_000_000          # 单条数据的元素上限，防止范围填错卡死
 
+# --------------------------------------------------------------------------
+# 生成策略
+# --------------------------------------------------------------------------
+
+STRATEGIES = ("random", "mixed", "edge")
+DEFAULT_STRATEGY = "mixed"
+
+# 均匀随机几乎打不到 hack 点：CF 上的反例绝大多数住在边界和退化结构里
+# （n=1、n=max、值为 0/1/-1、恰好撑爆 int/long long、整个数组全相等）。
+_INT32 = (-2 ** 31, 2 ** 31 - 1)
+_INT64 = (-2 ** 63, 2 ** 63 - 1)
+_EDGE_VALUES = (0, 1, -1, 2, *_INT32, *_INT64)
+
+# 取边界值的概率：random 完全不取，edge 全部取，mixed 混着来
+_EDGE_RATIO = {"random": 0.0, "mixed": 0.35, "edge": 1.0}
+# 整个数组填同一个值的概率（全相等是另一类高频反例）
+_FLAT_RATIO = {"random": 0.0, "mixed": 0.2, "edge": 0.5}
+
+
+def strategy_of(value) -> str:
+    """把配置里的策略名收敛到 STRATEGIES，脏值退回默认策略。"""
+    text = str(value or "").strip().lower()
+    return text if text in STRATEGIES else DEFAULT_STRATEGY
+
+
+def _edge_pool(lo: int, hi: int) -> list[int]:
+    """区间 [lo, hi] 内的候选边界值：端点 ±1 与经典溢出值。"""
+    pool = [lo, lo + 1, hi - 1, hi]
+    pool.extend(v for v in _EDGE_VALUES if lo <= v <= hi)
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for value in pool:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def _pick_int(rng: random.Random, lo: int, hi: int, strategy: str) -> int:
+    if lo == hi:
+        return lo
+    if rng.random() >= _EDGE_RATIO[strategy]:
+        return rng.randint(lo, hi)
+    return rng.choice(_edge_pool(lo, hi))
+
 
 # --------------------------------------------------------------------------
 # 生成计划
@@ -83,19 +128,24 @@ def _bounds(rng_range: dict, default_min: int, default_max: int) -> tuple[int, i
     return lo, hi
 
 
-def _int_value(name: str, cfg_vars: dict, rng: random.Random, env: dict) -> int:
+def _int_value(name: str, cfg_vars: dict, rng: random.Random, strategy: str) -> int:
     rng_range = cfg_vars.get(name) or {}
     lo, hi = _bounds(rng_range, DEFAULT_INT_MIN, DEFAULT_INT_MAX)
-    return rng.randint(lo, hi)
+    return _pick_int(rng, lo, hi, strategy)
 
 
-def _str_value(name: str, cfg_vars: dict, scan_cfg: dict, rng: random.Random) -> str:
+def _str_value(name: str, cfg_vars: dict, scan_cfg: dict, rng: random.Random,
+               strategy: str) -> str:
     rng_range = cfg_vars.get(name) or {}
     lo, hi = _bounds(rng_range, DEFAULT_STR_MIN, DEFAULT_STR_MAX)
-    length = rng.randint(lo, hi)
+    length = _pick_int(rng, lo, hi, strategy)
     alphabet = scan_cfg.get("alphabet") or "abcdefghijklmnopqrstuvwxyz"
     if not alphabet:
         alphabet = "abcdefghijklmnopqrstuvwxyz"
+    if rng.random() < _FLAT_RATIO[strategy]:
+        # 整串同一个字符：卡掉按位置分情况、按字符种类数目的写法
+        char = rng.choice(alphabet)
+        return char * length
     return "".join(rng.choice(alphabet) for _ in range(length))
 
 
@@ -114,7 +164,7 @@ def _level_count(level: dict, env: dict) -> int:
 
 
 def _array_lines(spec: VarSpec, cfg_vars: dict, rng: random.Random, env: dict,
-                 budget: dict) -> list[str]:
+                 budget: dict, strategy: str = DEFAULT_STRATEGY) -> list[str]:
     rng_range = cfg_vars.get(spec.name) or {}
     lo, hi = _bounds(rng_range, DEFAULT_INT_MIN, DEFAULT_INT_MAX)
 
@@ -145,7 +195,11 @@ def _array_lines(spec: VarSpec, cfg_vars: dict, rng: random.Random, env: dict,
     # 一维就是一整行，二维就是矩阵，三维及以上按最后一维折行。
     cols = counts[-1]
     rows = total // cols
-    return [" ".join(str(rng.randint(lo, hi)) for _ in range(cols))
+    if rng.random() < _FLAT_RATIO[strategy]:
+        # 整块填同一个值（多半是边界值）：全相等、全 0、全最大值这类退化数据
+        single = str(_pick_int(rng, lo, hi, strategy))
+        return [" ".join([single] * cols) for _ in range(rows)]
+    return [" ".join(str(_pick_int(rng, lo, hi, strategy)) for _ in range(cols))
             for _ in range(rows)]
 
 
@@ -163,25 +217,25 @@ def _spend(budget: dict, amount: int, what: str) -> None:
 # --------------------------------------------------------------------------
 
 def _emit_rows(rows, cfg_vars: dict, cfg_opts: dict, rng: random.Random,
-               env: dict, out: list[str], budget: dict) -> None:
+               env: dict, out: list[str], budget: dict, strategy: str) -> None:
     for row in rows:
         kind = row[0]
         if kind == "line":
             tokens = []
             for name in row[1]:
                 _spend(budget, 1, f"变量 {name}")
-                value = _int_value(name, cfg_vars, rng, env)
+                value = _int_value(name, cfg_vars, rng, strategy)
                 env[name] = value
                 tokens.append(str(value))
             out.append(" ".join(tokens))
         elif kind == "array":
-            out.extend(_array_lines(row[1], cfg_vars, rng, env, budget))
+            out.extend(_array_lines(row[1], cfg_vars, rng, env, budget, strategy))
         elif kind == "string":
             spec = row[1]
             rng_range = cfg_vars.get(spec.name) or {}
             str_hi = _bounds(rng_range, DEFAULT_STR_MIN, DEFAULT_STR_MAX)[1]
             _spend(budget, max(str_hi, 0), f"字符串 {spec.name}")
-            out.append(_str_value(spec.name, cfg_vars, cfg_opts, rng))
+            out.append(_str_value(spec.name, cfg_vars, cfg_opts, rng, strategy))
         elif kind == "repeat":
             var = row[1]
             if var in env:
@@ -200,7 +254,7 @@ def _emit_rows(rows, cfg_vars: dict, cfg_opts: dict, rng: random.Random,
                         f"单条数据过大（超过 {MAX_ELEMENTS} 个元素），"
                         f"请检查多组测试次数与 n 的范围"
                     )
-                _emit_rows(row[2], cfg_vars, cfg_opts, rng, env, out, budget)
+                _emit_rows(row[2], cfg_vars, cfg_opts, rng, env, out, budget, strategy)
 
 
 def generate_with(plan: list, cfg, rng: random.Random) -> bytes:
@@ -209,7 +263,8 @@ def generate_with(plan: list, cfg, rng: random.Random) -> bytes:
     budget = {"left": MAX_ELEMENTS}
     cfg_vars = cfg.vars or {}
     cfg_opts = {"alphabet": cfg.alphabet}
-    _emit_rows(plan, cfg_vars, cfg_opts, rng, env, out, budget)
+    strategy = strategy_of(getattr(cfg, "strategy", DEFAULT_STRATEGY))
+    _emit_rows(plan, cfg_vars, cfg_opts, rng, env, out, budget, strategy)
     text = "\n".join(out)
     if text and not text.endswith("\n"):
         text += "\n"

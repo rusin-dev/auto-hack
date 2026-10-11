@@ -23,6 +23,7 @@ class Config:
     max_hits: int = 1
     threads: int = 1                   # 对拍并行线程数
     seed: int | None = None
+    strategy: str = "mixed"            # 数据生成策略: random / mixed / edge
     alphabet: str = "abcdefghijklmnopqrstuvwxyz"
     checks: dict = field(default_factory=lambda: dict(DEFAULT_CHECKS))
     vars: dict = field(default_factory=dict)
