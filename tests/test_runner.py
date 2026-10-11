@@ -30,11 +30,17 @@ FAIL = """
 int main() { return 3; }
 """
 
+# 写入后立即读回并打印：只写不读会被 -O2 的死存储消除整体删掉，
+# 页面根本没落地，峰值内存量不到，MLE 判定也就测不到。
 FATTY = """
 #include <vector>
+#include <cstdio>
 int main() {
     std::vector<char> v(200u << 20);
-    for (unsigned long long i = 0; i < v.size(); i += 4096) v[i] = 1;
+    for (size_t i = 0; i < v.size(); i += 4096) v[i] = (char)i;
+    long long s = 0;
+    for (size_t i = 0; i < v.size(); i += 4096) s += v[i];
+    printf("%lld\\n", s);
     return 0;
 }
 """
@@ -96,8 +102,10 @@ class RunProgramTest(unittest.TestCase):
                                root / "echo")
         cls.spin = compile_cpp(_write_source(root, "spin.cpp", SPIN),
                                root / "spin")
-        cls.fail = compile_cpp(_write_source(root, "fail.cpp", FAIL),
-                               root / "fail")
+        # 命名不能叫 cls.fail：那会覆盖 unittest 的 TestCase.fail，
+        # 之后任何断言失败都变成 "WindowsPath is not callable"，看不出真实原因
+        cls.bad_exit = compile_cpp(_write_source(root, "fail.cpp", FAIL),
+                                   root / "fail")
         cls.fatty = compile_cpp(_write_source(root, "fatty.cpp", FATTY),
                                 root / "fatty")
 
@@ -118,7 +126,7 @@ class RunProgramTest(unittest.TestCase):
         self.assertFalse(res.ok)
 
     def test_crash_on_nonzero_exit(self):
-        res = run_program(self.fail, b"", timeout=10)
+        res = run_program(self.bad_exit, b"", timeout=10)
         self.assertTrue(res.crash)
         self.assertEqual(res.rc, 3)
         self.assertFalse(res.ok)
