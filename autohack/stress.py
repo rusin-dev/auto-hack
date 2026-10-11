@@ -63,14 +63,16 @@ class StressReport:
 
 
 # --------------------------------------------------------------------------
-# 归一化输出（与 Codeforces 一致：忽略行尾空白与末尾空行）
+# 归一化输出（与 Codeforces 的 token checker 一致：空白完全不影响判定）
 # --------------------------------------------------------------------------
 
 def normalize(data: bytes) -> list[bytes]:
-    lines = [line.rstrip(b" \t\r") for line in data.split(b"\n")]
-    while lines and lines[-1] == b"":
-        lines.pop()
-    return lines
+    """按任意空白切分成 token 序列。
+
+    行内多空格、Tab、CRLF、每行一个数与一行多个数、末尾空行都不算差异——
+    按整行比较会把这类排版差异误判成 WA，产出的 hack 点在 CF 上是无效的。
+    """
+    return data.split()
 
 
 def outputs_equal(a: bytes, b: bytes) -> bool:

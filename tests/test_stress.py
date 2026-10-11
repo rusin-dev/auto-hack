@@ -42,10 +42,23 @@ int main() {
 
 
 class NormalizeTest(unittest.TestCase):
-    def test_ignores_trailing_spaces_and_blank_lines(self):
-        self.assertEqual(normalize(b"1 2 \r\n3\t\n\n"), [b"1 2", b"3"])
+    def test_whitespace_is_not_a_difference(self):
+        """回归：按整行比较会把排版差异误判成 WA。"""
+        self.assertEqual(normalize(b"1 2 \r\n3\t\n\n"), [b"1", b"2", b"3"])
         self.assertTrue(outputs_equal(b"1 2 \n3\n", b"1 2\n3\n\n"))
+        # 行内多余空格 / Tab / CRLF
+        self.assertTrue(outputs_equal(b"1  2\r\n", b"1\t2\n"))
+        # 一行多个数 vs 每行一个数
+        self.assertTrue(outputs_equal(b"1 2 3\n", b"1\n2\n3\n"))
+        # 末尾换行缺失
+        self.assertTrue(outputs_equal(b"42", b"42\n"))
+
+    def test_real_differences_still_hit(self):
         self.assertFalse(outputs_equal(b"1\n", b"2\n"))
+        self.assertFalse(outputs_equal(b"1 2\n", b"1 2 3\n"))   # 少一个 token
+        self.assertFalse(outputs_equal(b"1 2\n", b"1\n"))       # 多一个 token
+        self.assertFalse(outputs_equal(b"\n", b"42\n"))         # 空输出
+        self.assertFalse(outputs_equal(b"12\n", b"1 2\n"))      # 合并数字不等于拆分
 
 
 class SaveHitsTest(unittest.TestCase):
