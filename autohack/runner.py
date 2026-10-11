@@ -260,7 +260,7 @@ class _MemoryWatcher:
                 self._record()
                 return
 
-    def start(self) -> "_MemoryWatcher":
+    def start(self) -> _MemoryWatcher:
         self._thread.start()
         return self
 
@@ -356,7 +356,7 @@ def run_generator(command: list[str], cwd: Path, timeout: float = 10.0) -> bytes
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        raise BuildError(f"生成器超时 ({timeout:g}s): {' '.join(command)}")
+        raise BuildError(f"生成器超时 ({timeout:g}s): {' '.join(command)}") from None
     if proc.returncode != 0:
         raise BuildError(
             f"生成器返回 {proc.returncode}: {' '.join(command)}\n"

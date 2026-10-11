@@ -8,7 +8,7 @@ from unittest import mock
 from autohack.config import Config
 from autohack.generator import _edge_pool
 from autohack.runner import RunResult
-from autohack.stress import (Hit, normalize, outputs_equal, save_hits, stress)
+from autohack.stress import Hit, normalize, outputs_equal, save_hits, stress
 
 STD = """
 #include <iostream>

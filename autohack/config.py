@@ -46,9 +46,6 @@ class Config:
         cfg.checks = checks
         return cfg
 
-    def range_of(self, name: str) -> dict:
-        return dict(self.vars.get(name, {}) or {})
-
 
 def config_path(problem_dir: Path) -> Path:
     return Path(problem_dir) / CONFIG_NAME

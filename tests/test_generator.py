@@ -5,9 +5,16 @@ import unittest
 
 from autohack.asts import VarSpec
 from autohack.config import Config
-from autohack.generator import (MAX_ELEMENTS, STRATEGIES, _array_lines,
-                                _edge_pool, _pick_int, generate_with,
-                                plan_text, strategy_of)
+from autohack.generator import (
+    MAX_ELEMENTS,
+    STRATEGIES,
+    _array_lines,
+    _edge_pool,
+    _pick_int,
+    generate_with,
+    plan_text,
+    strategy_of,
+)
 
 FULL_BUDGET = {"left": MAX_ELEMENTS}
 

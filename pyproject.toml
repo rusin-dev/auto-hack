@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-hack"
+description = "全自动化 Codeforces Div.3 公开 Hack 的对拍工具"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dynamic = ["version"]
+dependencies = [
+    "tree-sitter>=0.23,<0.27",
+    "tree-sitter-cpp>=0.23,<0.24",
+    "PyYAML>=6.0,<7",
+    "rich>=13.0,<16",
+]
+
+[project.scripts]
+auto-hack = "autohack.cli:main"
+
+[tool.setuptools]
+packages = ["autohack"]
+
+[tool.setuptools.dynamic]
+# 版本号只在 autohack/__init__.py 里写一份，避免和包元数据漂移
+version = { attr = "autohack.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "UP", "B", "BLE", "S"]
+ignore = [
+    "S311",   # random.Random 只用来播种测试数据，与密码学无关
+    "S603",   # 本工具的本职就是调用 g++ / 用户提供的 gen.*，输入来自本地配置
+    "S607",   # 编译器按 PATH 上的 g++/clang++ 解析，不是硬编码绝对路径
+]

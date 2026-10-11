@@ -94,7 +94,6 @@ class RepeatInfo:
 
 @dataclass
 class Scan:
-    source: str
     reads: list[Read]
     decls: dict[str, Decl]
     loops: list[Loop]
@@ -109,13 +108,13 @@ class VarSpec:
     kind: str                   # scalar / array / string
     base: str
     levels: list[dict] = field(default_factory=list)   # 数组各维的下标范围
-    count_expr: str | None = None                       # 无下标信息时的元素个数表达式
     line: int = 1
     op: str = "cin"
 
     @property
     def needs_count(self) -> bool:
-        return self.kind == "array" and not self.levels and not self.count_expr
+        """数组没能推断出长度，必须由用户在 config 里填 count。"""
+        return self.kind == "array" and not self.levels
 
 
 # --------------------------------------------------------------------------
@@ -377,7 +376,7 @@ def _collect_reads(root: Node, src: bytes) -> list[Read]:
                 if kids[0].type not in ("string_literal", "concatenated_string"):
                     continue
                 specs = _FMT_RE.findall(_text(kids[0], src))
-                for spec, tgt in zip(specs, kids[1:]):
+                for spec, tgt in zip(specs, kids[1:], strict=False):
                     name, indexes = _resolve_target(tgt, src)
                     reads.append(Read("scanf", name, indexes, spec[-1],
                                       tgt.start_point[0] + 1, tgt.start_byte,
@@ -517,7 +516,7 @@ def _collect_loops(root: Node, src: bytes) -> list[Loop]:
             loops.append(_parse_for(node, src))
         elif node.type == "while_statement":
             loops.append(_parse_while(node, src))
-    loops.sort(key=lambda l: (l.start, -(l.end - l.start)))
+    loops.sort(key=lambda lp: (lp.start, -(lp.end - lp.start)))
     return loops
 
 
@@ -681,8 +680,4 @@ def scan(source: str) -> Scan:
             if repeat.start <= read.byte <= repeat.end:
                 read.repeat = True
 
-    return Scan(source, reads, decls, loops, repeat, warnings)
-
-
-def describe(scan_obj: Scan) -> tuple[list[VarSpec], list[str]]:
-    return resolve_vars(scan_obj)
+    return Scan(reads, decls, loops, repeat, warnings)

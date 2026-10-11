@@ -7,8 +7,7 @@ from contextlib import redirect_stdout
 
 from rich.console import Console
 
-from autohack.progress import (ProgressReporter, RoundInfo, fmt_duration,
-                               fmt_mb, fmt_ms)
+from autohack.progress import ProgressReporter, RoundInfo, fmt_duration, fmt_mb, fmt_ms
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 

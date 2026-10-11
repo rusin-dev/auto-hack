@@ -174,13 +174,10 @@ def _array_lines(spec: VarSpec, cfg_vars: dict, rng: random.Random, env: dict,
     elif spec.levels:
         counts = [_level_count(level, env) for level in spec.levels]
     else:
-        count_expr = spec.count_expr
-        if not count_expr:
-            raise ValueError(
-                f"数组 {spec.name} 的元素个数未知，请在 config.yaml 的 "
-                f"vars.{spec.name}.count 里填写（例如 n 或 10）"
-            )
-        counts = [max(0, evaluate(count_expr, env))]
+        raise ValueError(
+            f"数组 {spec.name} 的元素个数未知，请在 config.yaml 的 "
+            f"vars.{spec.name}.count 里填写（例如 n 或 10）"
+        )
 
     counts = [max(0, c) for c in counts]
     total = 1
@@ -288,7 +285,7 @@ def plan_text(plan: list, indent: int = 0) -> str:
                                  f"{'' if lv['inclusive'] else '(不含右端)'}"
                                  for lv in spec.levels)
             else:
-                desc = f"count={spec.count_expr or '?'}"
+                desc = f"个数取自 config 的 vars.{spec.name}.count"
             lines.append(f"{pad}数组: {spec.name} {desc}")
         elif kind == "string":
             lines.append(f"{pad}字符串: {row[1].name}")

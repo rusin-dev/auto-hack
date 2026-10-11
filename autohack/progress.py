@@ -8,9 +8,14 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from rich.console import Console
-from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn,
-                           TimeElapsedColumn, TimeRemainingColumn)
-
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 # --------------------------------------------------------------------------
 # 格式化
@@ -98,9 +103,17 @@ class ProgressReporter:
         self._cand_since = 0.0                    # 该候选尺寸首次观察到的时刻
         self._dirty = False                       # 尺寸变过、尚未稳定重锚
         self._settle = 0.2                        # 稳定窗口（秒）：拖动停止后才重锚
+        self._internals = True                    # rich 私有结构可用时才做残帧自愈
         if enabled:
             self._progress = self._build(console)
-            self._install_resize_guard()
+            live = self._progress.live
+            # live._lock / live._live_render 不是 rich 的公开 API，版本变动时
+            # 检测不到就退回 rich 的默认刷新：进度条可能重新出现残帧，
+            # 但不会再在跑对拍的中途抛 AttributeError。
+            self._internals = (hasattr(live, "_lock")
+                               and hasattr(live, "_live_render"))
+            if self._internals:
+                self._install_resize_guard()
 
     # ---------------- 构建 ----------------
 
@@ -158,14 +171,14 @@ class ProgressReporter:
 
         ``force=True`` 跳过稳定窗口（收尾时用），立刻完成重锚。
         """
-        if self._progress is None:
+        if self._progress is None or not self._internals:
             return True
         live = self._progress.live
         with live._lock:                         # 刷新线程 / 主线程串行化检测
             console = self._progress.console
             try:
                 size = console.size
-            except Exception:
+            except Exception:                   # noqa: BLE001
                 return True
             now = time.perf_counter()
             if self._last_size is None:          # 首次观测：只记账
@@ -242,6 +255,10 @@ class ProgressReporter:
     def print(self, text: str = "") -> None:
         """打印一行日志；进度条运行时交给 rich 与进度行自动交错。"""
         if self._progress is None:
+            self._print_plain(text)
+            return
+        if not self._internals:
+            self._log_tail.append(text)
             self._print_plain(text)
             return
         live = self._progress.live

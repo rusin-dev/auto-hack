@@ -69,7 +69,7 @@ def _ask(prompt: str, default: str | None = None) -> str:
         raw = input(f"{prompt}{suffix}: ").strip()
     except (EOFError, KeyboardInterrupt):
         _p("")
-        raise SystemExit(1)
+        raise SystemExit(1) from None
     if not raw and default is not None:
         return str(default)
     return raw

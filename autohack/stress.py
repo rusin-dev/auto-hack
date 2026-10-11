@@ -19,8 +19,6 @@ from .runner import BuildError, compile_cpp, run_generator, run_program
 
 HACK_DIR_NAME = "hack"
 
-UNLIMITED = 0          # rounds / max_hits 为 0 表示无休止
-
 
 def _resolve_threads(value) -> int:
     """把用户给的线程数收敛成 >= 1 的整数（脏配置 / 0 / 负数都兜住）。"""

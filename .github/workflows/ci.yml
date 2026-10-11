@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # 工具面向 Windows 控制台（独立窗口 / VT / 窗口尺寸自愈），先在 Windows 上跑
+    # 端到端用例：这些用例会真的调用 g++ 编译并运行 C++ 程序。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 让 g++ 可用（MSYS2 的 mingw64 不一定在 PATH 上）
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - run: pip install -r requirements.txt ruff
+
+      - name: Lint
+        run: ruff check autohack tests main.py
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -t .
